@@ -9,5 +9,19 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "module"
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tkwind/pharmazephyr-backend.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tkwind/pharmazephyr-backend/issues"
+  },
+  "homepage": "https://github.com/tkwind/pharmazephyr-backend#readme",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "razorpay": "^2.9.6"
+  }
 }
