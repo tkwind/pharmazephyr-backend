@@ -544,8 +544,56 @@ app.get("/admin/event-registrations", requireAdmin, requireFirebaseAdmin, async 
 
 app.get("/admin/events", requireAdmin, requireFirebaseAdmin, async (_req, res) => {
   try {
-    const snap = await adminDb.collection("events").get();
-    const rows = snap.docs.map(mapDoc).sort((a, b) => {
+    const [cfgSnap, registrySnap] = await Promise.all([
+      adminDb.collection("events").get(),
+      adminDb.collection("eventsRegistry").get(),
+    ]);
+
+    const merged = new Map();
+
+    cfgSnap.docs.forEach((docSnap) => {
+      const row = mapDoc(docSnap);
+      const eventId = String(row.eventId || row.id || "").trim();
+      if (!eventId) return;
+      merged.set(eventId, {
+        ...row,
+        eventId,
+        _source: "events",
+      });
+    });
+
+    registrySnap.docs.forEach((docSnap) => {
+      const row = mapDoc(docSnap);
+      const eventId = String(row.eventId || row.id || "").trim();
+      if (!eventId) return;
+      const existing = merged.get(eventId) || {};
+      merged.set(eventId, {
+        eventId,
+        category: existing.category ?? row.category ?? "",
+        categoryTitle: existing.categoryTitle ?? row.categoryTitle ?? "",
+        name: existing.name ?? row.name ?? "",
+        desc: existing.desc ?? row.desc ?? "",
+        priceLabel: existing.priceLabel ?? row.priceLabel ?? "—",
+        amount: existing.amount ?? row.amount ?? 0,
+        pricingMode: existing.pricingMode ?? "single",
+        internalPriceLabel: existing.internalPriceLabel ?? "",
+        internalAmount: existing.internalAmount ?? null,
+        externalPriceLabel: existing.externalPriceLabel ?? "",
+        externalAmount: existing.externalAmount ?? null,
+        participationMode: existing.participationMode ?? "",
+        participationLabel: existing.participationLabel ?? "",
+        active: existing.active ?? true,
+        capacity: existing.capacity ?? null,
+        teamSize: existing.teamSize ?? null,
+        sortOrder: existing.sortOrder ?? 0,
+        updatedAt: existing.updatedAt ?? row.updatedAt ?? null,
+        updatedBy: existing.updatedBy ?? null,
+        _source: existing._source ? "events+registry" : "eventsRegistry",
+        ...existing,
+      });
+    });
+
+    const rows = Array.from(merged.values()).sort((a, b) => {
       const ac = String(a.category || "");
       const bc = String(b.category || "");
       if (ac !== bc) return ac.localeCompare(bc);
@@ -563,10 +611,18 @@ app.post("/admin/events/upsert", requireAdmin, requireFirebaseAdmin, async (req,
     const {
       eventId,
       category,
+      categoryTitle = "",
       name,
       desc = "",
       priceLabel = "—",
       amount = 0,
+      pricingMode = "single",
+      internalPriceLabel = "",
+      internalAmount = null,
+      externalPriceLabel = "",
+      externalAmount = null,
+      participationMode = "",
+      participationLabel = "",
       active = true,
       capacity = null,
       teamSize = null,
@@ -580,10 +636,18 @@ app.post("/admin/events/upsert", requireAdmin, requireFirebaseAdmin, async (req,
     const payload = {
       eventId: String(eventId),
       category: String(category),
+      categoryTitle: String(categoryTitle || ""),
       name: String(name),
       desc: String(desc || ""),
       priceLabel: String(priceLabel || "—"),
       amount: parseAmount(amount),
+      pricingMode: String(pricingMode || "single"),
+      internalPriceLabel: String(internalPriceLabel || ""),
+      internalAmount: internalAmount == null || internalAmount === "" ? null : parseAmount(internalAmount),
+      externalPriceLabel: String(externalPriceLabel || ""),
+      externalAmount: externalAmount == null || externalAmount === "" ? null : parseAmount(externalAmount),
+      participationMode: String(participationMode || ""),
+      participationLabel: String(participationLabel || ""),
       active: !!active,
       capacity: capacity == null || capacity === "" ? null : Number(capacity),
       teamSize: teamSize == null || teamSize === "" ? null : Number(teamSize),
@@ -599,6 +663,7 @@ app.post("/admin/events/upsert", requireAdmin, requireFirebaseAdmin, async (req,
       actorEmail: normalize(req.adminUser.email || ""),
       eventId: String(eventId),
       category: String(category),
+      categoryTitle: String(categoryTitle || ""),
       active: !!active,
       amount: parseAmount(amount),
     });
@@ -607,6 +672,64 @@ app.post("/admin/events/upsert", requireAdmin, requireFirebaseAdmin, async (req,
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to save event config" });
+  }
+});
+
+app.post("/admin/events/bulk-upsert", requireAdmin, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const rows = Array.isArray(req.body?.events) ? req.body.events : [];
+    if (!rows.length) return res.status(400).json({ error: "events array is required" });
+
+    const batch = adminDb.batch();
+    let saved = 0;
+
+    for (const row of rows) {
+      const eventId = String(row?.eventId || "").trim();
+      const category = String(row?.category || "").trim();
+      const name = String(row?.name || "").trim();
+      if (!eventId || !category || !name) continue;
+
+      const payload = {
+        eventId,
+        category,
+        categoryTitle: String(row?.categoryTitle || ""),
+        name,
+        desc: String(row?.desc || ""),
+        priceLabel: String(row?.priceLabel || "—"),
+        amount: parseAmount(row?.amount),
+        pricingMode: String(row?.pricingMode || "single"),
+        internalPriceLabel: String(row?.internalPriceLabel || ""),
+        internalAmount: row?.internalAmount == null || row?.internalAmount === "" ? null : parseAmount(row.internalAmount),
+        externalPriceLabel: String(row?.externalPriceLabel || ""),
+        externalAmount: row?.externalAmount == null || row?.externalAmount === "" ? null : parseAmount(row.externalAmount),
+        participationMode: String(row?.participationMode || ""),
+        participationLabel: String(row?.participationLabel || ""),
+        active: row?.active !== false,
+        capacity: row?.capacity == null || row?.capacity === "" ? null : Number(row.capacity),
+        teamSize: row?.teamSize == null || row?.teamSize === "" ? null : Number(row.teamSize),
+        sortOrder: Number.isFinite(Number(row?.sortOrder)) ? Number(row.sortOrder) : 0,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedBy: normalize(req.adminUser.email || ""),
+      };
+
+      batch.set(adminDb.collection("events").doc(eventId), payload, { merge: true });
+      saved += 1;
+    }
+
+    if (!saved) return res.status(400).json({ error: "No valid events to import" });
+
+    await batch.commit();
+
+    await writeAdminAuditLog("event_config_bulk_upsert", {
+      source: "admin_api",
+      actorEmail: normalize(req.adminUser.email || ""),
+      count: saved,
+    });
+
+    res.json({ ok: true, count: saved });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to bulk import events" });
   }
 });
 
