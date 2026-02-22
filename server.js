@@ -17,6 +17,26 @@ function normalize(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function makeEventRegistrationDocId(regId, eventId) {
+  const safeRegId = String(regId || "reg").replace(/[^a-zA-Z0-9_-]/g, "_");
+  const safeEventId = String(eventId || "event").replace(/[^a-zA-Z0-9_-]/g, "_");
+  return `${safeRegId}__${safeEventId}`;
+}
+
+function parseAmount(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
+function verifyRazorpaySignature(orderId, paymentId, signature) {
+  const body = `${orderId}|${paymentId}`;
+  const expected = crypto
+    .createHmac("sha256", process.env.RZP_SECRET)
+    .update(body)
+    .digest("hex");
+  return expected === signature;
+}
+
 function parseServiceAccount() {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON_B64) {
     const raw = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8");
@@ -68,6 +88,12 @@ app.post("/razorpay/webhook", express.raw({ type: "application/json" }), async (
     }
 
     const payload = JSON.parse(req.body.toString("utf8"));
+    const webhookEventId = String(req.header("x-razorpay-event-id") || "").trim();
+    const dedupeKey = webhookEventId || crypto.createHash("sha256").update(req.body).digest("hex");
+    const accepted = await markWebhookEventProcessed(dedupeKey, payload);
+    if (!accepted) {
+      return res.json({ ok: true, duplicate: true });
+    }
     await reconcileWebhookEvent(payload);
     return res.json({ ok: true });
   } catch (err) {
@@ -117,6 +143,29 @@ async function writeAdminAuditLog(action, details = {}) {
   }
 }
 
+async function markWebhookEventProcessed(eventKey, payload = {}) {
+  if (!adminDb) return true;
+  if (!eventKey) return true;
+  const ref = adminDb.collection("processedWebhookEvents").doc(String(eventKey));
+  try {
+    await adminDb.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (snap.exists) {
+        throw new Error("duplicate_webhook_event");
+      }
+      tx.set(ref, {
+        eventKey: String(eventKey),
+        razorpayEventType: payload?.event || null,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+    return true;
+  } catch (err) {
+    if (String(err?.message || "").includes("duplicate_webhook_event")) return false;
+    throw err;
+  }
+}
+
 async function reconcileEventPayment({ paymentId, orderId, source = "server", rawEvent = null }) {
   if (!adminDb) return { updated: 0, reason: "firebase_admin_unavailable" };
   if (!paymentId && !orderId) return { updated: 0, reason: "missing_payment_and_order" };
@@ -162,6 +211,122 @@ async function reconcileEventPayment({ paymentId, orderId, source = "server", ra
   });
 
   return { updated };
+}
+
+async function finalizeEventRegistrationServer({
+  user,
+  regId,
+  eventId,
+  category,
+  eventName,
+  eventDesc = "",
+  eventPrice = "—",
+  amount = 0,
+  paymentRequired = false,
+  paymentStatus = "not_required",
+  razorpayOrderId = null,
+  razorpayPaymentId = null,
+}) {
+  if (!adminDb) throw new Error("Firebase Admin not configured");
+
+  const eventAmount = parseAmount(amount);
+  const docId = makeEventRegistrationDocId(regId, eventId);
+  const regRef = adminDb.collection("registrations").doc(regId);
+  const eventRegistryRef = adminDb.collection("eventsRegistry").doc(eventId);
+  const participantRef = eventRegistryRef.collection("participants").doc(regId);
+  const eventRegistrationRef = adminDb.collection("eventRegistrations").doc(docId);
+
+  let didAdd = false;
+  await adminDb.runTransaction(async (tx) => {
+    const regSnap = await tx.get(regRef);
+    if (!regSnap.exists) throw new Error("Registration not found");
+
+    const reg = regSnap.data() || {};
+    if (reg.uid && reg.uid !== user.uid) throw new Error("Registration owner mismatch");
+    if (!reg.uid && normalize(reg.email) !== normalize(user.email || "")) {
+      throw new Error("Registration owner mismatch");
+    }
+
+    const current = Array.isArray(reg.registeredEvents) ? reg.registeredEvents : [];
+    if (current.some((x) => x?.id === eventId)) return;
+
+    didAdd = true;
+    const next = [
+      ...current,
+      {
+        id: eventId,
+        category,
+        name: eventName,
+        desc: eventDesc,
+        price: eventPrice,
+        registeredAt: admin.firestore.Timestamp.now(),
+      },
+    ];
+
+    tx.update(regRef, { registeredEvents: next });
+
+    tx.set(eventRegistryRef, {
+      eventId,
+      category,
+      name: eventName,
+      desc: eventDesc,
+      priceLabel: eventPrice,
+      amount: eventAmount,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    tx.set(participantRef, {
+      regId,
+      uid: reg.uid || user.uid,
+      email: reg.email || normalize(user.email || ""),
+      fullName: reg.fullName || user.name || "",
+      college: reg.college || "",
+      phone: reg.phone || "",
+      eventId,
+      category,
+      eventName,
+      eventPrice,
+      amount: eventAmount,
+      status: "registered",
+      source: "server",
+      registeredAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    tx.set(eventRegistrationRef, {
+      registrationDocId: docId,
+      regId,
+      uid: reg.uid || user.uid,
+      email: reg.email || normalize(user.email || ""),
+      fullName: reg.fullName || user.name || "",
+      college: reg.college || "",
+      phone: reg.phone || "",
+      eventId,
+      category,
+      eventName,
+      eventDesc,
+      eventPrice,
+      amount: eventAmount,
+      paymentRequired: !!paymentRequired,
+      paymentStatus,
+      status: "registered",
+      source: "server",
+      razorpayOrderId: razorpayOrderId || null,
+      razorpayPaymentId: razorpayPaymentId || null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  });
+
+  await writeAdminAuditLog("event_registration_finalize", {
+    source: "event_finalize_api",
+    actorEmail: normalize(user.email || ""),
+    regId,
+    eventId,
+    paymentStatus,
+    added: didAdd,
+  });
+
+  return { added: didAdd, docId };
 }
 
 async function reconcileWebhookEvent(payload) {
@@ -214,6 +379,21 @@ async function requireAdmin(req, res, next) {
   }
 }
 
+async function requireUser(req, res, next) {
+  try {
+    if (!adminDb) return res.status(503).json({ error: "Firebase Admin not configured" });
+    const authHeader = String(req.headers.authorization || "");
+    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+    if (!token) return res.status(401).json({ error: "Missing bearer token" });
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.userToken = decoded;
+    next();
+  } catch (err) {
+    console.error("User auth failed:", err);
+    res.status(401).json({ error: "Invalid user token" });
+  }
+}
+
 function mapDoc(docSnap) {
   return { id: docSnap.id, ...docSnap.data() };
 }
@@ -241,14 +421,7 @@ app.post("/create-order", async (req, res) => {
 
 app.post("/verify", async (req, res) => {
   const { order_id, payment_id, signature } = req.body || {};
-  const body = `${order_id}|${payment_id}`;
-
-  const expected = crypto
-    .createHmac("sha256", process.env.RZP_SECRET)
-    .update(body)
-    .digest("hex");
-
-  if (expected !== signature) {
+  if (!verifyRazorpaySignature(order_id, payment_id, signature)) {
     return res.status(400).json({ success: false });
   }
 
@@ -262,6 +435,65 @@ app.post("/verify", async (req, res) => {
   } catch (err) {
     console.error("Post-verify reconcile failed:", err);
     return res.json({ success: true, reconciled: { updated: 0, error: "reconcile_failed" } });
+  }
+});
+
+app.post("/event/finalize-registration", requireUser, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const {
+      regId,
+      eventId,
+      category,
+      eventName,
+      eventDesc = "",
+      eventPrice = "—",
+      amount = 0,
+      orderId = null,
+      paymentId = null,
+      signature = null,
+    } = req.body || {};
+
+    if (!regId || !eventId || !category || !eventName) {
+      return res.status(400).json({ error: "Missing required event registration fields" });
+    }
+
+    const numericAmount = parseAmount(amount);
+    const paymentRequired = numericAmount > 0;
+    let paymentStatus = paymentRequired ? "pending" : "not_required";
+
+    if (paymentRequired) {
+      if (!orderId || !paymentId || !signature) {
+        return res.status(400).json({ error: "Missing payment proof for paid event" });
+      }
+      if (!verifyRazorpaySignature(orderId, paymentId, signature)) {
+        return res.status(400).json({ error: "Invalid Razorpay signature" });
+      }
+      paymentStatus = "paid";
+    }
+
+    const result = await finalizeEventRegistrationServer({
+      user: {
+        uid: req.userToken.uid,
+        email: req.userToken.email || null,
+        name: req.userToken.name || null,
+      },
+      regId: String(regId),
+      eventId: String(eventId),
+      category: String(category),
+      eventName: String(eventName),
+      eventDesc: String(eventDesc || ""),
+      eventPrice: String(eventPrice || "—"),
+      amount: numericAmount,
+      paymentRequired,
+      paymentStatus,
+      razorpayOrderId: orderId || null,
+      razorpayPaymentId: paymentId || null,
+    });
+
+    res.json({ ok: true, ...result, paymentStatus });
+  } catch (err) {
+    console.error("Event finalize failed:", err);
+    res.status(500).json({ error: err?.message || "Event finalization failed" });
   }
 });
 
