@@ -542,6 +542,94 @@ app.get("/admin/event-registrations", requireAdmin, requireFirebaseAdmin, async 
   }
 });
 
+app.get("/admin/events", requireAdmin, requireFirebaseAdmin, async (_req, res) => {
+  try {
+    const snap = await adminDb.collection("events").get();
+    const rows = snap.docs.map(mapDoc).sort((a, b) => {
+      const ac = String(a.category || "");
+      const bc = String(b.category || "");
+      if (ac !== bc) return ac.localeCompare(bc);
+      return String(a.name || "").localeCompare(String(b.name || ""));
+    });
+    res.json({ ok: true, rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to load events config" });
+  }
+});
+
+app.post("/admin/events/upsert", requireAdmin, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const {
+      eventId,
+      category,
+      name,
+      desc = "",
+      priceLabel = "—",
+      amount = 0,
+      active = true,
+      capacity = null,
+      teamSize = null,
+      sortOrder = 0,
+    } = req.body || {};
+
+    if (!eventId || !category || !name) {
+      return res.status(400).json({ error: "eventId, category, and name are required" });
+    }
+
+    const payload = {
+      eventId: String(eventId),
+      category: String(category),
+      name: String(name),
+      desc: String(desc || ""),
+      priceLabel: String(priceLabel || "—"),
+      amount: parseAmount(amount),
+      active: !!active,
+      capacity: capacity == null || capacity === "" ? null : Number(capacity),
+      teamSize: teamSize == null || teamSize === "" ? null : Number(teamSize),
+      sortOrder: Number.isFinite(Number(sortOrder)) ? Number(sortOrder) : 0,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedBy: normalize(req.adminUser.email || ""),
+    };
+
+    await adminDb.collection("events").doc(String(eventId)).set(payload, { merge: true });
+
+    await writeAdminAuditLog("event_config_upsert", {
+      source: "admin_api",
+      actorEmail: normalize(req.adminUser.email || ""),
+      eventId: String(eventId),
+      category: String(category),
+      active: !!active,
+      amount: parseAmount(amount),
+    });
+
+    res.json({ ok: true, event: payload });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to save event config" });
+  }
+});
+
+app.post("/admin/events/delete", requireAdmin, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const eventId = String(req.body?.eventId || "").trim();
+    if (!eventId) return res.status(400).json({ error: "eventId is required" });
+
+    await adminDb.collection("events").doc(eventId).delete();
+
+    await writeAdminAuditLog("event_config_delete", {
+      source: "admin_api",
+      actorEmail: normalize(req.adminUser.email || ""),
+      eventId,
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to delete event config" });
+  }
+});
+
 app.post("/admin/fest-checkin", requireAdmin, requireFirebaseAdmin, async (req, res) => {
   try {
     const regId = String(req.body?.regId || "").trim();
