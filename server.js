@@ -66,10 +66,15 @@ const adminDb = firebaseApp ? admin.firestore() : null;
 const MAIL_FROM = String(process.env.MAIL_FROM || "").trim();
 const MAIL_REPLY_TO = String(process.env.MAIL_REPLY_TO || "").trim();
 const MAIL_ENABLED = String(process.env.MAIL_ENABLED || "true").trim().toLowerCase() !== "false";
+const SMTP_HOST = String(process.env.SMTP_HOST || "").trim().replace(/^\s*smtps?:\/\//i, "");
+const SMTP_PORT = Number(String(process.env.SMTP_PORT || "587").trim() || 587);
+const SMTP_SECURE = String(process.env.SMTP_SECURE || "").trim().toLowerCase() === "true" || SMTP_PORT === 465;
+const SMTP_USER = String(process.env.SMTP_USER || "").trim();
+const SMTP_PASS = String(process.env.SMTP_PASS || "");
 let mailTransporter = null;
 
 function hasSmtpConfig() {
-  return !!(process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS && MAIL_FROM);
+  return !!(SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS && MAIL_FROM);
 }
 
 function getMailTransporter() {
@@ -77,12 +82,18 @@ function getMailTransporter() {
   if (!hasSmtpConfig()) return null;
   if (mailTransporter) return mailTransporter;
   mailTransporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: String(process.env.SMTP_SECURE || "").toLowerCase() === "true" || Number(process.env.SMTP_PORT) === 465,
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
     auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
+      user: SMTP_USER,
+      pass: SMTP_PASS,
+    },
+    connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 15000),
+    greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT_MS || 10000),
+    socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT_MS || 20000),
+    tls: {
+      servername: SMTP_HOST,
     },
   });
   return mailTransporter;
@@ -135,6 +146,14 @@ app.get("/health", (_req, res) => {
     service: "pharmazephyr-razorpay",
     at: Date.now(),
     firebaseAdmin: !!adminDb,
+    mail: {
+      enabled: MAIL_ENABLED,
+      configured: hasSmtpConfig(),
+      host: SMTP_HOST || null,
+      port: Number.isFinite(SMTP_PORT) ? SMTP_PORT : null,
+      secure: SMTP_SECURE,
+      fromConfigured: !!MAIL_FROM,
+    },
   });
 });
 
