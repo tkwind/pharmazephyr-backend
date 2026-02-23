@@ -484,6 +484,29 @@ function deriveTeamStatus(team, members = []) {
   return "draft";
 }
 
+function teamIsLocked(team = {}) {
+  const status = String(team.status || "").toLowerCase();
+  const paymentStatus = String(team.paymentStatus || "").toLowerCase();
+  return status === "registered" || paymentStatus === "paid" || paymentStatus === "not_required";
+}
+
+function teamCountsFromMembers(members = []) {
+  return {
+    accepted: members.filter((m) => m.inviteStatus === "accepted").length,
+    invited: members.filter((m) => m.inviteStatus === "invited").length,
+    declined: members.filter((m) => m.inviteStatus === "declined").length,
+  };
+}
+
+function nextTeamPatchFromMembers(team, members) {
+  const counts = teamCountsFromMembers(members);
+  return {
+    memberCount: counts.accepted,
+    status: deriveTeamStatus(team, members),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+}
+
 async function registerAcceptedTeamMembersForEvent({
   tx,
   teamRef,
@@ -1023,6 +1046,170 @@ app.post("/teams/respond-invite", requireUser, requireFirebaseAdmin, async (req,
   } catch (err) {
     console.error("Respond invite failed:", err);
     res.status(500).json({ error: err?.message || "Failed to respond to invite" });
+  }
+});
+
+app.post("/teams/remove-member", requireUser, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const teamId = String(req.body?.teamId || "").trim();
+    const memberRegId = String(req.body?.memberRegId || "").trim();
+    if (!teamId || !memberRegId) return res.status(400).json({ error: "teamId and memberRegId are required" });
+
+    const teamRef = teamCollection().doc(teamId);
+    const memberRef = teamRef.collection("members").doc(memberRegId);
+
+    await adminDb.runTransaction(async (tx) => {
+      const [teamSnap, memberSnap, allMembersSnap] = await Promise.all([
+        tx.get(teamRef),
+        tx.get(memberRef),
+        tx.get(teamRef.collection("members")),
+      ]);
+      if (!teamSnap.exists) throw new Error("Team not found");
+      if (!memberSnap.exists) throw new Error("Member not found");
+      const team = teamSnap.data() || {};
+      if (String(team.captainUid || "") !== String(req.userToken.uid || "")) throw new Error("Only captain can remove members");
+      if (teamIsLocked(team)) throw new Error("Team is locked");
+
+      const member = memberSnap.data() || {};
+      if (member.role === "captain") throw new Error("Transfer captain first");
+      if (!["invited", "accepted"].includes(String(member.inviteStatus || ""))) {
+        throw new Error("Member is not active in team");
+      }
+
+      tx.update(memberRef, {
+        inviteStatus: "removed",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        respondedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      const membersAfter = allMembersSnap.docs.map((d) => (
+        d.id === memberRegId
+          ? { ...(d.data() || {}), inviteStatus: "removed" }
+          : (d.data() || {})
+      ));
+      tx.update(teamRef, nextTeamPatchFromMembers(team, membersAfter));
+    });
+
+    const bundle = await loadTeamWithMembers(teamId);
+    res.json({ ok: true, team: bundle?.team, members: bundle?.members });
+  } catch (err) {
+    console.error("Remove member failed:", err);
+    res.status(500).json({ error: err?.message || "Failed to remove member" });
+  }
+});
+
+app.post("/teams/transfer-captain", requireUser, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const teamId = String(req.body?.teamId || "").trim();
+    const memberRegId = String(req.body?.memberRegId || "").trim();
+    if (!teamId || !memberRegId) return res.status(400).json({ error: "teamId and memberRegId are required" });
+
+    const teamRef = teamCollection().doc(teamId);
+    const targetRef = teamRef.collection("members").doc(memberRegId);
+
+    await adminDb.runTransaction(async (tx) => {
+      const [teamSnap, targetSnap, allMembersSnap] = await Promise.all([
+        tx.get(teamRef),
+        tx.get(targetRef),
+        tx.get(teamRef.collection("members")),
+      ]);
+      if (!teamSnap.exists) throw new Error("Team not found");
+      if (!targetSnap.exists) throw new Error("Target member not found");
+      const team = teamSnap.data() || {};
+      if (String(team.captainUid || "") !== String(req.userToken.uid || "")) throw new Error("Only captain can transfer captaincy");
+      if (teamIsLocked(team)) throw new Error("Team is locked");
+
+      const target = targetSnap.data() || {};
+      if (target.role === "captain") throw new Error("Member is already captain");
+      if (target.inviteStatus !== "accepted") throw new Error("Target member must accept invite first");
+
+      const oldCaptainDoc = allMembersSnap.docs.find((d) => (d.data() || {}).role === "captain");
+      if (!oldCaptainDoc) throw new Error("Captain member record not found");
+
+      tx.update(oldCaptainDoc.ref, {
+        role: "member",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      tx.update(targetRef, {
+        role: "captain",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      tx.update(teamRef, {
+        captainUid: target.uid || null,
+        captainRegId: target.regId || memberRegId,
+        captainEmail: target.email || null,
+        captainName: target.fullName || "",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    const bundle = await loadTeamWithMembers(teamId);
+    res.json({ ok: true, team: bundle?.team, members: bundle?.members });
+  } catch (err) {
+    console.error("Transfer captain failed:", err);
+    res.status(500).json({ error: err?.message || "Failed to transfer captain" });
+  }
+});
+
+app.post("/teams/leave", requireUser, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const teamId = String(req.body?.teamId || "").trim();
+    if (!teamId) return res.status(400).json({ error: "teamId is required" });
+
+    const regSnap = await adminDb.collection("registrations").where("uid", "==", req.userToken.uid).limit(1).get();
+    if (regSnap.empty) return res.status(400).json({ error: "Fest registration required" });
+    const reg = { id: regSnap.docs[0].id, ...regSnap.docs[0].data() };
+    const memberRegId = String(reg.regId || reg.id);
+    const teamRef = teamCollection().doc(teamId);
+    const memberRef = teamRef.collection("members").doc(memberRegId);
+
+    let deletedTeam = false;
+    await adminDb.runTransaction(async (tx) => {
+      const [teamSnap, memberSnap, allMembersSnap] = await Promise.all([
+        tx.get(teamRef),
+        tx.get(memberRef),
+        tx.get(teamRef.collection("members")),
+      ]);
+      if (!teamSnap.exists) throw new Error("Team not found");
+      if (!memberSnap.exists) throw new Error("You are not part of this team");
+      const team = teamSnap.data() || {};
+      if (teamIsLocked(team)) throw new Error("Team is locked");
+      const member = memberSnap.data() || {};
+      if (member.uid && String(member.uid) !== String(req.userToken.uid)) throw new Error("Member mismatch");
+
+      const allMembers = allMembersSnap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+      const activeOthers = allMembers.filter((m) =>
+        m.id !== memberRegId && ["accepted", "invited"].includes(String(m.inviteStatus || ""))
+      );
+
+      if (member.role === "captain" && activeOthers.length > 0) {
+        throw new Error("Transfer captain before leaving the team");
+      }
+
+      if (member.role === "captain" && activeOthers.length === 0) {
+        allMembersSnap.docs.forEach((d) => tx.delete(d.ref));
+        tx.delete(teamRef);
+        deletedTeam = true;
+        return;
+      }
+
+      tx.update(memberRef, {
+        inviteStatus: "left",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        respondedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      const membersAfter = allMembers.map((m) => (
+        m.id === memberRegId ? { ...m, inviteStatus: "left" } : m
+      ));
+      tx.update(teamRef, nextTeamPatchFromMembers(team, membersAfter));
+    });
+
+    if (deletedTeam) return res.json({ ok: true, deletedTeam: true, teamId });
+    const bundle = await loadTeamWithMembers(teamId);
+    res.json({ ok: true, team: bundle?.team, members: bundle?.members, deletedTeam: false });
+  } catch (err) {
+    console.error("Leave team failed:", err);
+    res.status(500).json({ error: err?.message || "Failed to leave team" });
   }
 });
 
