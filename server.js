@@ -4,6 +4,7 @@ import crypto from "crypto";
 import cors from "cors";
 import dotenv from "dotenv";
 import admin from "firebase-admin";
+import nodemailer from "nodemailer";
 
 dotenv.config();
 
@@ -62,6 +63,30 @@ function initFirebaseAdmin() {
 
 const firebaseApp = initFirebaseAdmin();
 const adminDb = firebaseApp ? admin.firestore() : null;
+const MAIL_FROM = String(process.env.MAIL_FROM || "").trim();
+const MAIL_REPLY_TO = String(process.env.MAIL_REPLY_TO || "").trim();
+const MAIL_ENABLED = String(process.env.MAIL_ENABLED || "true").trim().toLowerCase() !== "false";
+let mailTransporter = null;
+
+function hasSmtpConfig() {
+  return !!(process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS && MAIL_FROM);
+}
+
+function getMailTransporter() {
+  if (!MAIL_ENABLED) return null;
+  if (!hasSmtpConfig()) return null;
+  if (mailTransporter) return mailTransporter;
+  mailTransporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: String(process.env.SMTP_SECURE || "").toLowerCase() === "true" || Number(process.env.SMTP_PORT) === 465,
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    },
+  });
+  return mailTransporter;
+}
 
 const app = express();
 app.use(cors());
@@ -141,6 +166,143 @@ async function writeAdminAuditLog(action, details = {}) {
   } catch (err) {
     console.error("Audit log write failed:", err);
   }
+}
+
+function emailDocKey(type, key) {
+  const a = String(type || "email").replace(/[^a-zA-Z0-9_-]/g, "_");
+  const b = String(key || "key").replace(/[^a-zA-Z0-9_-]/g, "_");
+  return `${a}__${b}`;
+}
+
+async function sendTransactionalEmail({ type, dedupeKey, to, subject, html, text, meta = {} }) {
+  const transporter = getMailTransporter();
+  const recipient = String(to || "").trim();
+  const emailKey = emailDocKey(type, dedupeKey);
+
+  if (!recipient) return { ok: false, skipped: true, reason: "missing_recipient" };
+  if (!MAIL_ENABLED) return { ok: false, skipped: true, reason: "mail_disabled" };
+  if (!transporter) return { ok: false, skipped: true, reason: "smtp_not_configured" };
+  if (!adminDb) return { ok: false, skipped: true, reason: "firebase_admin_unavailable" };
+
+  const ref = adminDb.collection("transactionalEmails").doc(emailKey);
+  let shouldSend = false;
+  try {
+    await adminDb.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const existing = snap.exists ? (snap.data() || {}) : null;
+      if (existing?.status === "sent") return;
+      shouldSend = true;
+      tx.set(ref, {
+        type,
+        dedupeKey: String(dedupeKey || ""),
+        to: recipient,
+        subject: String(subject || ""),
+        status: "sending",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: existing?.createdAt || admin.firestore.FieldValue.serverTimestamp(),
+        meta,
+      }, { merge: true });
+    });
+  } catch (err) {
+    console.error("Email dedupe transaction failed:", err);
+    return { ok: false, skipped: true, reason: "dedupe_failed" };
+  }
+
+  if (!shouldSend) return { ok: true, duplicate: true };
+
+  try {
+    const info = await transporter.sendMail({
+      from: MAIL_FROM,
+      to: recipient,
+      replyTo: MAIL_REPLY_TO || undefined,
+      subject,
+      text,
+      html,
+    });
+
+    await ref.set({
+      status: "sent",
+      provider: "smtp",
+      messageId: info?.messageId || null,
+      sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return { ok: true, messageId: info?.messageId || null };
+  } catch (err) {
+    console.error("Email send failed:", err);
+    await ref.set({
+      status: "error",
+      error: String(err?.message || "send_failed").slice(0, 500),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    return { ok: false, error: "send_failed" };
+  }
+}
+
+function renderFestConfirmationEmail(reg) {
+  const regId = reg?.regId || "—";
+  const fullName = reg?.fullName || "Participant";
+  const college = reg?.college || "—";
+  const subject = `Pharmazephyr 2026 Registration Confirmed • ${regId}`;
+  const text = [
+    `Hi ${fullName},`,
+    "",
+    "Your Pharmazephyr 2026 fest registration is confirmed.",
+    `Reg ID: ${regId}`,
+    `College: ${college}`,
+    "",
+    "Please keep your QR pass and Reg ID ready at entry.",
+    "",
+    "Regards,",
+    "Pharmazephyr 2026 Team",
+  ].join("\n");
+  const html = `
+    <div style="font-family:Inter,Arial,sans-serif;max-width:640px;margin:0 auto;padding:20px;color:#1f1431;">
+      <h2 style="margin:0 0 12px;">Pharmazephyr 2026 Registration Confirmed</h2>
+      <p style="margin:0 0 12px;">Hi ${fullName},</p>
+      <p style="margin:0 0 16px;">Your fest registration is confirmed.</p>
+      <div style="border:1px solid #e4d6ff;border-radius:12px;padding:14px 16px;background:#faf7ff;">
+        <div><strong>Reg ID:</strong> ${regId}</div>
+        <div style="margin-top:6px;"><strong>College:</strong> ${college}</div>
+      </div>
+      <p style="margin:16px 0 0;">Keep your QR pass and Reg ID ready at entry.</p>
+    </div>
+  `;
+  return { subject, text, html };
+}
+
+function renderEventConfirmationEmail({ reg, event }) {
+  const fullName = reg?.fullName || "Participant";
+  const regId = reg?.regId || event?.regId || "—";
+  const eventName = event?.eventName || event?.name || "Event";
+  const category = event?.category || "—";
+  const eventPrice = event?.eventPrice || event?.eventPriceLabel || event?.priceLabel || "—";
+  const subject = `Event Registration Confirmed • ${eventName}`;
+  const text = [
+    `Hi ${fullName},`,
+    "",
+    `Your event registration is confirmed for: ${eventName}`,
+    `Category: ${category}`,
+    `Reg ID: ${regId}`,
+    `Fee: ${eventPrice}`,
+    "",
+    "Regards,",
+    "Pharmazephyr 2026 Team",
+  ].join("\n");
+  const html = `
+    <div style="font-family:Inter,Arial,sans-serif;max-width:640px;margin:0 auto;padding:20px;color:#1f1431;">
+      <h2 style="margin:0 0 12px;">Event Registration Confirmed</h2>
+      <p style="margin:0 0 12px;">Hi ${fullName},</p>
+      <p style="margin:0 0 16px;">Your registration for <strong>${eventName}</strong> is confirmed.</p>
+      <div style="border:1px solid #e4d6ff;border-radius:12px;padding:14px 16px;background:#faf7ff;">
+        <div><strong>Category:</strong> ${category}</div>
+        <div style="margin-top:6px;"><strong>Reg ID:</strong> ${regId}</div>
+        <div style="margin-top:6px;"><strong>Fee:</strong> ${eventPrice}</div>
+      </div>
+    </div>
+  `;
+  return { subject, text, html };
 }
 
 async function markWebhookEventProcessed(eventKey, payload = {}) {
@@ -235,6 +397,7 @@ async function finalizeEventRegistrationServer({
   const eventRegistryRef = adminDb.collection("eventsRegistry").doc(eventId);
   const participantRef = eventRegistryRef.collection("participants").doc(regId);
   const eventRegistrationRef = adminDb.collection("eventRegistrations").doc(docId);
+  let emailContext = null;
 
   let didAdd = false;
   await adminDb.runTransaction(async (tx) => {
@@ -315,6 +478,22 @@ async function finalizeEventRegistrationServer({
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
+
+    emailContext = {
+      reg: {
+        regId,
+        fullName: reg.fullName || user.name || "",
+        email: reg.email || normalize(user.email || ""),
+        college: reg.college || "",
+      },
+      event: {
+        regId,
+        eventId,
+        eventName,
+        category,
+        eventPrice,
+      },
+    };
   });
 
   await writeAdminAuditLog("event_registration_finalize", {
@@ -326,7 +505,7 @@ async function finalizeEventRegistrationServer({
     added: didAdd,
   });
 
-  return { added: didAdd, docId };
+  return { added: didAdd, docId, emailContext };
 }
 
 async function reconcileWebhookEvent(payload) {
@@ -438,6 +617,48 @@ app.post("/verify", async (req, res) => {
   }
 });
 
+app.post("/registration/send-confirmation", requireUser, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const regId = String(req.body?.regId || "").trim();
+    if (!regId) return res.status(400).json({ error: "regId is required" });
+
+    const regSnap = await adminDb.collection("registrations").doc(regId).get();
+    if (!regSnap.exists) return res.status(404).json({ error: "Registration not found" });
+    const reg = regSnap.data() || {};
+
+    const ownerEmail = normalize(req.userToken.email || "");
+    if (reg.uid && reg.uid !== req.userToken.uid) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    if (!reg.uid && normalize(reg.email) !== ownerEmail) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const email = normalize(reg.email || ownerEmail);
+    const content = renderFestConfirmationEmail({
+      regId: reg.regId || regId,
+      fullName: reg.fullName || req.userToken.name || "Participant",
+      college: reg.college || "",
+    });
+
+    const emailResult = await sendTransactionalEmail({
+      type: "fest_registration_confirmation",
+      dedupeKey: reg.regId || regId,
+      to: email,
+      ...content,
+      meta: {
+        regId: reg.regId || regId,
+        actorEmail: ownerEmail,
+      },
+    });
+
+    res.json({ ok: true, email: emailResult });
+  } catch (err) {
+    console.error("Fest confirmation email failed:", err);
+    res.status(500).json({ error: "Failed to send confirmation email" });
+  }
+});
+
 app.post("/event/finalize-registration", requireUser, requireFirebaseAdmin, async (req, res) => {
   try {
     const {
@@ -490,7 +711,23 @@ app.post("/event/finalize-registration", requireUser, requireFirebaseAdmin, asyn
       razorpayPaymentId: paymentId || null,
     });
 
-    res.json({ ok: true, ...result, paymentStatus });
+    let emailResult = null;
+    if (result?.emailContext?.reg?.email) {
+      const content = renderEventConfirmationEmail(result.emailContext);
+      emailResult = await sendTransactionalEmail({
+        type: "event_registration_confirmation",
+        dedupeKey: result.docId,
+        to: result.emailContext.reg.email,
+        ...content,
+        meta: {
+          regId: result.emailContext.reg.regId,
+          eventId: result.emailContext.event.eventId,
+          actorEmail: normalize(req.userToken.email || ""),
+        },
+      });
+    }
+
+    res.json({ ok: true, added: !!result?.added, docId: result?.docId, paymentStatus, email: emailResult });
   } catch (err) {
     console.error("Event finalize failed:", err);
     res.status(500).json({ error: err?.message || "Event finalization failed" });
