@@ -501,6 +501,19 @@ async function registerAcceptedTeamMembersForEvent({
   const eventPrice = String(team.eventPrice || eventConfig?.priceLabel || "—");
   const teamAmount = parseAmount(team.amount ?? eventConfig?.amount ?? 0);
   const eventRegistryRef = adminDb.collection("eventsRegistry").doc(eventId);
+  const regRefs = acceptedMembers
+    .map((member) => ({
+      member,
+      regId: String(member.regId || "").trim(),
+    }))
+    .filter((x) => x.regId)
+    .map((x) => ({ ...x, regRef: adminDb.collection("registrations").doc(x.regId) }));
+
+  const regSnaps = await Promise.all(regRefs.map((x) => tx.get(x.regRef)));
+  const regSnapMap = new Map();
+  regRefs.forEach((x, index) => {
+    regSnapMap.set(x.regId, { member: x.member, regRef: x.regRef, regSnap: regSnaps[index] });
+  });
 
   tx.set(eventRegistryRef, {
     eventId,
@@ -515,11 +528,11 @@ async function registerAcceptedTeamMembersForEvent({
   for (const member of acceptedMembers) {
     const regId = String(member.regId || "").trim();
     if (!regId) continue;
-    const regRef = adminDb.collection("registrations").doc(regId);
+    const regBundle = regSnapMap.get(regId);
+    if (!regBundle) continue;
+    const { regRef, regSnap } = regBundle;
     const participantRef = eventRegistryRef.collection("participants").doc(regId);
     const eventRegistrationRef = adminDb.collection("eventRegistrations").doc(makeEventRegistrationDocId(regId, eventId));
-
-    const regSnap = await tx.get(regRef);
     if (!regSnap.exists) continue;
     const reg = regSnap.data() || {};
     const current = Array.isArray(reg.registeredEvents) ? reg.registeredEvents : [];
