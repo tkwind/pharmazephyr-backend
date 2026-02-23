@@ -713,14 +713,30 @@ app.get("/teams/my", requireUser, requireFirebaseAdmin, async (req, res) => {
     const teamBundles = await Promise.all([...teamIds].map((teamId) => loadTeamWithMembers(teamId)));
     const bundles = teamBundles.filter(Boolean);
 
+    const eventIds = [...new Set(bundles.map((b) => String(b?.team?.eventId || "")).filter(Boolean))];
+    const eventConfigMap = new Map();
+    await Promise.all(eventIds.map(async (eventId) => {
+      try {
+        const snap = await adminDb.collection("events").doc(eventId).get();
+        if (snap.exists) eventConfigMap.set(eventId, snap.data() || {});
+      } catch {
+        // non-fatal enrichment
+      }
+    }));
+
     const invites = [];
     const myTeams = [];
     for (const bundle of bundles) {
       const team = bundle.team;
       const members = bundle.members;
+      const eventCfg = eventConfigMap.get(String(team.eventId || "")) || {};
+      const effectiveAmount = parseAmount(team.amount ?? eventCfg.amount ?? 0);
+      const effectivePrice = String(team.eventPrice || eventCfg.priceLabel || "—");
       const myMember = members.find((m) => m.uid === uid);
       const summary = {
         ...team,
+        amount: effectiveAmount,
+        eventPrice: effectivePrice,
         members,
         memberCounts: {
           accepted: members.filter((m) => m.inviteStatus === "accepted").length,
@@ -1006,18 +1022,10 @@ app.post("/teams/finalize-payment", requireUser, requireFirebaseAdmin, async (re
     if (!teamId) return res.status(400).json({ error: "teamId is required" });
 
     const teamRef = teamCollection().doc(teamId);
-    const [teamSnap, eventSnap] = await Promise.all([
-      teamRef.get(),
-      (async () => {
-        const t = await teamRef.get();
-        if (!t.exists) return null;
-        const data = t.data() || {};
-        if (!data.eventId) return null;
-        return adminDb.collection("events").doc(String(data.eventId)).get();
-      })(),
-    ]);
+    const teamSnap = await teamRef.get();
     if (!teamSnap.exists) return res.status(404).json({ error: "Team not found" });
     const team = teamSnap.data() || {};
+    const eventSnap = team.eventId ? await adminDb.collection("events").doc(String(team.eventId)).get() : null;
     if (String(team.captainUid || "") !== String(req.userToken.uid || "")) {
       return res.status(403).json({ error: "Only captain can pay for the team" });
     }
@@ -1075,6 +1083,8 @@ app.post("/teams/finalize-payment", requireUser, requireFirebaseAdmin, async (re
         status: "registered",
         paymentStatus: teamAmount > 0 ? "paid" : "not_required",
         memberCount: accepted.length,
+        amount: teamAmount,
+        eventPrice: String(freshTeam.eventPrice || eventConfig?.priceLabel || "—"),
         paidAt: teamAmount > 0 ? admin.firestore.FieldValue.serverTimestamp() : null,
         razorpayOrderId: orderId || null,
         razorpayPaymentId: paymentId || null,
