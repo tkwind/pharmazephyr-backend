@@ -487,7 +487,7 @@ function deriveTeamStatus(team, members = []) {
 function teamIsLocked(team = {}) {
   const status = String(team.status || "").toLowerCase();
   const paymentStatus = String(team.paymentStatus || "").toLowerCase();
-  return status === "registered" || paymentStatus === "paid" || paymentStatus === "not_required";
+  return ["registered", "cancelled"].includes(status) || paymentStatus === "paid" || paymentStatus === "not_required";
 }
 
 function teamCountsFromMembers(members = []) {
@@ -1415,6 +1415,132 @@ app.post("/admin/team-status", requireAdmin, requireFirebaseAdmin, async (req, r
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to update team status" });
+  }
+});
+
+app.post("/admin/team-control", requireAdmin, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const teamId = String(req.body?.teamId || "").trim();
+    const action = String(req.body?.action || "").trim().toLowerCase();
+    if (!teamId) return res.status(400).json({ error: "teamId is required" });
+    if (!["unlock", "cancel", "force_register", "delete"].includes(action)) {
+      return res.status(400).json({ error: "Invalid team control action" });
+    }
+
+    const teamRef = adminDb.collection("teams").doc(teamId);
+    const preSnap = await teamRef.get();
+    if (!preSnap.exists) return res.status(404).json({ error: "Team not found" });
+    const preTeam = preSnap.data() || {};
+    const eventSnap = preTeam.eventId ? await adminDb.collection("events").doc(String(preTeam.eventId)).get() : null;
+    const eventConfig = eventSnap?.exists ? (eventSnap.data() || {}) : {};
+
+    if (action === "delete") {
+      const membersSnap = await teamRef.collection("members").get();
+      const batch = adminDb.batch();
+      membersSnap.docs.forEach((d) => batch.delete(d.ref));
+      batch.delete(teamRef);
+      const teamEventRegs = await adminDb.collection("eventRegistrations").where("teamId", "==", teamId).limit(500).get();
+      teamEventRegs.docs.forEach((d) => {
+        batch.set(d.ref, {
+          status: "cancelled",
+          teamDeleted: true,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+      });
+      await batch.commit();
+      await writeAdminAuditLog("admin_team_delete", {
+        source: "admin_team_control_api",
+        actorEmail: normalize(req.adminUser?.email || ""),
+        teamId,
+      });
+      return res.json({ ok: true, action, deleted: true });
+    }
+
+    if (action === "cancel") {
+      await teamRef.set({
+        status: "cancelled",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      await writeAdminAuditLog("admin_team_cancel", {
+        source: "admin_team_control_api",
+        actorEmail: normalize(req.adminUser?.email || ""),
+        teamId,
+      });
+      return res.json({ ok: true, action });
+    }
+
+    if (action === "unlock") {
+      await adminDb.runTransaction(async (tx) => {
+        const [teamSnap, membersSnap] = await Promise.all([
+          tx.get(teamRef),
+          tx.get(teamRef.collection("members")),
+        ]);
+        if (!teamSnap.exists) throw new Error("Team not found");
+        const team = teamSnap.data() || {};
+        const members = membersSnap.docs.map((d) => d.data() || {});
+        const derived = deriveTeamStatus({ ...team, paymentStatus: "pending", status: "draft" }, members);
+        const amount = parseAmount(team.amount ?? eventConfig?.amount ?? 0);
+        tx.set(teamRef, {
+          status: derived,
+          paymentStatus: amount > 0 ? "pending" : "not_started",
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+      });
+      await writeAdminAuditLog("admin_team_unlock", {
+        source: "admin_team_control_api",
+        actorEmail: normalize(req.adminUser?.email || ""),
+        teamId,
+      });
+      return res.json({ ok: true, action });
+    }
+
+    if (action === "force_register") {
+      await adminDb.runTransaction(async (tx) => {
+        const [teamSnap, membersSnap] = await Promise.all([
+          tx.get(teamRef),
+          tx.get(teamRef.collection("members")),
+        ]);
+        if (!teamSnap.exists) throw new Error("Team not found");
+        const team = teamSnap.data() || {};
+        const members = membersSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        const accepted = members.filter((m) => m.inviteStatus === "accepted");
+        const pending = members.filter((m) => m.inviteStatus === "invited");
+        if (!accepted.length) throw new Error("No accepted members in team");
+        if (pending.length) throw new Error("Resolve pending invites before force register");
+
+        await registerAcceptedTeamMembersForEvent({
+          tx,
+          teamRef,
+          team: { ...team, teamId },
+          members,
+          eventConfig,
+          razorpayOrderId: team.razorpayOrderId || null,
+          razorpayPaymentId: team.razorpayPaymentId || null,
+        });
+
+        const amount = parseAmount(team.amount ?? eventConfig?.amount ?? 0);
+        tx.set(teamRef, {
+          status: "registered",
+          paymentStatus: amount > 0
+            ? (String(team.paymentStatus || "").toLowerCase() === "paid" ? "paid" : "manual_override")
+            : "not_required",
+          memberCount: accepted.length,
+          amount,
+          eventPrice: String(team.eventPrice || eventConfig?.priceLabel || "—"),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          forceRegisteredAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+      });
+      await writeAdminAuditLog("admin_team_force_register", {
+        source: "admin_team_control_api",
+        actorEmail: normalize(req.adminUser?.email || ""),
+        teamId,
+      });
+      return res.json({ ok: true, action });
+    }
+  } catch (err) {
+    console.error("Admin team control failed:", err);
+    res.status(500).json({ error: err?.message || "Failed to perform team action" });
   }
 });
 
