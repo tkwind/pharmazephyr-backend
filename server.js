@@ -1418,6 +1418,130 @@ app.post("/admin/team-status", requireAdmin, requireFirebaseAdmin, async (req, r
   }
 });
 
+app.get("/admin/team-detail", requireAdmin, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const teamId = String(req.query?.teamId || "").trim();
+    if (!teamId) return res.status(400).json({ error: "teamId is required" });
+    const bundle = await loadTeamWithMembers(teamId);
+    if (!bundle) return res.status(404).json({ error: "Team not found" });
+    const team = bundle.team;
+    const members = bundle.members;
+    const derivedStatus = deriveTeamStatus(team, members);
+    res.json({
+      ok: true,
+      team: {
+        ...team,
+        derivedStatus,
+        memberCounts: teamCountsFromMembers(members),
+      },
+      members,
+    });
+  } catch (err) {
+    console.error("Admin team detail failed:", err);
+    res.status(500).json({ error: "Failed to load team detail" });
+  }
+});
+
+app.post("/admin/team-member-control", requireAdmin, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const teamId = String(req.body?.teamId || "").trim();
+    const action = String(req.body?.action || "").trim().toLowerCase();
+    const memberRegId = String(req.body?.memberRegId || "").trim();
+    const inviteStatus = req.body?.inviteStatus == null ? null : String(req.body.inviteStatus).trim().toLowerCase();
+
+    if (!teamId) return res.status(400).json({ error: "teamId is required" });
+    if (!["remove", "make_captain", "set_invite_status"].includes(action)) {
+      return res.status(400).json({ error: "Invalid member action" });
+    }
+    if (!memberRegId) return res.status(400).json({ error: "memberRegId is required" });
+    if (action === "set_invite_status" && !["invited", "accepted", "declined", "removed", "left"].includes(inviteStatus || "")) {
+      return res.status(400).json({ error: "Invalid inviteStatus" });
+    }
+
+    const teamRef = adminDb.collection("teams").doc(teamId);
+    const memberRef = teamRef.collection("members").doc(memberRegId);
+
+    await adminDb.runTransaction(async (tx) => {
+      const [teamSnap, memberSnap, allMembersSnap] = await Promise.all([
+        tx.get(teamRef),
+        tx.get(memberRef),
+        tx.get(teamRef.collection("members")),
+      ]);
+      if (!teamSnap.exists) throw new Error("Team not found");
+      if (!memberSnap.exists) throw new Error("Member not found");
+      const team = teamSnap.data() || {};
+      const member = memberSnap.data() || {};
+      if (teamIsLocked(team)) throw new Error("Unlock team first to edit roster");
+
+      const nowTs = admin.firestore.FieldValue.serverTimestamp();
+      const allMembers = allMembersSnap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+
+      if (action === "remove") {
+        if (member.role === "captain") throw new Error("Transfer captain first");
+        tx.update(memberRef, {
+          inviteStatus: "removed",
+          updatedAt: nowTs,
+          respondedAt: nowTs,
+        });
+        const membersAfter = allMembers.map((m) => (m.id === memberRegId ? { ...m, inviteStatus: "removed" } : m));
+        tx.update(teamRef, nextTeamPatchFromMembers(team, membersAfter));
+        return;
+      }
+
+      if (action === "make_captain") {
+        if (member.inviteStatus !== "accepted") throw new Error("Target member must be accepted");
+        if (member.role === "captain") throw new Error("Member is already captain");
+        const currentCaptain = allMembersSnap.docs.find((d) => (d.data() || {}).role === "captain");
+        if (!currentCaptain) throw new Error("Current captain not found");
+        tx.update(currentCaptain.ref, { role: "member", updatedAt: nowTs });
+        tx.update(memberRef, { role: "captain", updatedAt: nowTs });
+        tx.update(teamRef, {
+          captainUid: member.uid || null,
+          captainRegId: member.regId || memberRegId,
+          captainEmail: member.email || null,
+          captainName: member.fullName || "",
+          updatedAt: nowTs,
+        });
+        return;
+      }
+
+      if (action === "set_invite_status") {
+        if (member.role === "captain" && inviteStatus !== "accepted") {
+          throw new Error("Captain status must remain accepted");
+        }
+        tx.update(memberRef, {
+          inviteStatus,
+          updatedAt: nowTs,
+          respondedAt: nowTs,
+          joinedAt: inviteStatus === "accepted" ? (member.joinedAt || nowTs) : (inviteStatus === "invited" ? null : member.joinedAt || null),
+        });
+        const membersAfter = allMembers.map((m) => (m.id === memberRegId ? { ...m, inviteStatus } : m));
+        tx.update(teamRef, nextTeamPatchFromMembers(team, membersAfter));
+      }
+    });
+
+    const bundle = await loadTeamWithMembers(teamId);
+    const members = bundle?.members || [];
+    await writeAdminAuditLog("admin_team_member_control", {
+      source: "admin_team_member_control_api",
+      actorEmail: normalize(req.adminUser?.email || ""),
+      teamId,
+      memberRegId,
+      action,
+      inviteStatus: inviteStatus || null,
+    });
+    res.json({
+      ok: true,
+      action,
+      team: bundle ? { ...bundle.team, derivedStatus: deriveTeamStatus(bundle.team, members), memberCounts: teamCountsFromMembers(members) } : null,
+      members,
+    });
+  } catch (err) {
+    console.error("Admin team member control failed:", err);
+    res.status(500).json({ error: err?.message || "Failed to update team member" });
+  }
+});
+
 app.post("/admin/team-control", requireAdmin, requireFirebaseAdmin, async (req, res) => {
   try {
     const teamId = String(req.body?.teamId || "").trim();
