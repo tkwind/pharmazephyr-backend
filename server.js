@@ -415,6 +415,75 @@ function mapDoc(docSnap) {
   return { id: docSnap.id, ...docSnap.data() };
 }
 
+function isTeamParticipationMode(eventConfig = {}) {
+  const mode = String(eventConfig?.participationMode || "").trim().toLowerCase();
+  const teamSize = Number(eventConfig?.teamSize || 0);
+  if (teamSize > 1) return true;
+  return ["team", "group", "duals", "dual"].includes(mode);
+}
+
+function normalizeTeamMode(eventConfig = {}) {
+  const mode = String(eventConfig?.participationMode || "").trim().toLowerCase();
+  if (["duals", "dual"].includes(mode)) return "duals";
+  if (["group", "team"].includes(mode)) return "team";
+  return mode || (Number(eventConfig?.teamSize || 0) > 1 ? "team" : "individual");
+}
+
+function teamCollection() {
+  return adminDb.collection("teams");
+}
+
+async function getRegistrationByRegIdOrEmail(identity) {
+  const raw = String(identity || "").trim();
+  if (!raw) return null;
+  const regIdLike = /^PZ26-/i.test(raw);
+  if (regIdLike) {
+    const snap = await adminDb.collection("registrations").doc(raw).get();
+    if (snap.exists) return { id: snap.id, ...snap.data() };
+  }
+  const email = normalize(raw);
+  if (!email.includes("@")) return null;
+  const snap = await adminDb.collection("registrations").where("email", "==", email).limit(1).get();
+  if (snap.empty) return null;
+  return { id: snap.docs[0].id, ...snap.docs[0].data() };
+}
+
+async function loadTeamWithMembers(teamId) {
+  const teamRef = teamCollection().doc(teamId);
+  const [teamSnap, membersSnap] = await Promise.all([
+    teamRef.get(),
+    teamRef.collection("members").get(),
+  ]);
+  if (!teamSnap.exists) return null;
+  const team = { id: teamSnap.id, ...teamSnap.data() };
+  const members = membersSnap.docs.map(mapDoc).sort((a, b) => {
+    if (a.role === "captain" && b.role !== "captain") return -1;
+    if (b.role === "captain" && a.role !== "captain") return 1;
+    return String(a.fullName || a.email || a.regId || "").localeCompare(String(b.fullName || b.email || b.regId || ""));
+  });
+  return { team, members };
+}
+
+async function userAlreadyInTeamForEvent(uid, eventId) {
+  const snap = await adminDb.collectionGroup("members")
+    .where("uid", "==", uid)
+    .where("eventId", "==", eventId)
+    .where("inviteStatus", "in", ["invited", "accepted"])
+    .limit(1)
+    .get();
+  return !snap.empty ? snap.docs[0] : null;
+}
+
+function deriveTeamStatus(team, members = []) {
+  const accepted = members.filter((m) => m.inviteStatus === "accepted").length;
+  const pending = members.filter((m) => m.inviteStatus === "invited").length;
+  const target = Number(team.targetSize || team.maxSize || 0);
+  if ((team.paymentStatus || "") === "paid") return "registered";
+  if (target > 0 && accepted >= target && pending === 0) return "ready_for_payment";
+  if (pending > 0 || accepted > 0) return "inviting";
+  return "draft";
+}
+
 app.post("/create-order", async (req, res) => {
   try {
     const requested = Number(req.body?.amount);
@@ -511,6 +580,310 @@ app.post("/event/finalize-registration", requireUser, requireFirebaseAdmin, asyn
   } catch (err) {
     console.error("Event finalize failed:", err);
     res.status(500).json({ error: err?.message || "Event finalization failed" });
+  }
+});
+
+app.get("/teams/my", requireUser, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const uid = String(req.userToken.uid || "");
+    const [captainTeamsSnap, memberEntriesSnap] = await Promise.all([
+      teamCollection().where("captainUid", "==", uid).limit(50).get(),
+      adminDb.collectionGroup("members")
+        .where("uid", "==", uid)
+        .where("inviteStatus", "in", ["invited", "accepted"])
+        .limit(100)
+        .get(),
+    ]);
+
+    const teamIds = new Set();
+    captainTeamsSnap.docs.forEach((d) => teamIds.add(d.id));
+    memberEntriesSnap.docs.forEach((d) => {
+      const teamId = String(d.data()?.teamId || d.ref.parent?.parent?.id || "");
+      if (teamId) teamIds.add(teamId);
+    });
+
+    const teamBundles = await Promise.all([...teamIds].map((teamId) => loadTeamWithMembers(teamId)));
+    const bundles = teamBundles.filter(Boolean);
+
+    const invites = [];
+    const myTeams = [];
+    for (const bundle of bundles) {
+      const team = bundle.team;
+      const members = bundle.members;
+      const myMember = members.find((m) => m.uid === uid);
+      const summary = {
+        ...team,
+        members,
+        memberCounts: {
+          accepted: members.filter((m) => m.inviteStatus === "accepted").length,
+          invited: members.filter((m) => m.inviteStatus === "invited").length,
+          declined: members.filter((m) => m.inviteStatus === "declined").length,
+        },
+        derivedStatus: deriveTeamStatus(team, members),
+      };
+      if (myMember?.role === "captain" || team.captainUid === uid || myMember?.inviteStatus === "accepted") {
+        myTeams.push(summary);
+      }
+      if (myMember && myMember.role !== "captain" && myMember.inviteStatus === "invited") {
+        invites.push({
+          teamId: team.id,
+          teamName: team.teamName,
+          eventId: team.eventId,
+          eventName: team.eventName,
+          category: team.category,
+          captainName: team.captainName || null,
+          captainEmail: team.captainEmail || null,
+          member: myMember,
+          createdAt: team.createdAt || null,
+        });
+      }
+    }
+
+    myTeams.sort((a, b) => String(a.teamName || "").localeCompare(String(b.teamName || "")));
+    invites.sort((a, b) => String(a.teamName || "").localeCompare(String(b.teamName || "")));
+
+    res.json({ ok: true, myTeams, invites });
+  } catch (err) {
+    console.error("Load my teams failed:", err);
+    res.status(500).json({ error: "Failed to load teams" });
+  }
+});
+
+app.post("/teams/create", requireUser, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const eventId = String(req.body?.eventId || "").trim();
+    const teamName = String(req.body?.teamName || "").trim();
+    if (!eventId) return res.status(400).json({ error: "eventId is required" });
+    if (!teamName) return res.status(400).json({ error: "teamName is required" });
+
+    const [eventSnap] = await Promise.all([
+      adminDb.collection("events").doc(eventId).get(),
+    ]);
+    if (!eventSnap.exists) return res.status(404).json({ error: "Event not found" });
+    const event = eventSnap.data() || {};
+    if (event.active === false) return res.status(400).json({ error: "Event is not active" });
+    if (!isTeamParticipationMode(event)) {
+      return res.status(400).json({ error: "This event does not support team registration" });
+    }
+
+    const regSnapQ = await adminDb.collection("registrations").where("uid", "==", req.userToken.uid).limit(1).get();
+    if (regSnapQ.empty) return res.status(400).json({ error: "Fest registration required before creating a team" });
+    const reg = { id: regSnapQ.docs[0].id, ...regSnapQ.docs[0].data() };
+
+    const existingMembership = await userAlreadyInTeamForEvent(req.userToken.uid, eventId);
+    if (existingMembership) return res.status(409).json({ error: "You are already in a team for this event" });
+
+    const targetSize = Number(event.teamSize || 0) > 1 ? Number(event.teamSize) : (normalizeTeamMode(event) === "duals" ? 2 : 2);
+    const teamRef = teamCollection().doc();
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    const teamPayload = {
+      teamId: teamRef.id,
+      eventId,
+      eventName: String(event.name || req.body?.eventName || "Event"),
+      category: String(event.publicCategory || event.category || req.body?.category || "events"),
+      eventRegistrationType: normalizeTeamMode(event),
+      captainUid: req.userToken.uid,
+      captainRegId: reg.regId || reg.id,
+      captainEmail: normalize(reg.email || req.userToken.email || ""),
+      captainName: reg.fullName || req.userToken.name || "",
+      teamName,
+      status: "draft",
+      paymentStatus: "not_started",
+      minSize: Number(event.minTeamSize || targetSize || 2),
+      maxSize: Number(event.maxTeamSize || targetSize || 2),
+      targetSize,
+      memberCount: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const captainMember = {
+      teamId: teamRef.id,
+      eventId,
+      regId: reg.regId || reg.id,
+      uid: reg.uid || req.userToken.uid,
+      email: normalize(reg.email || req.userToken.email || ""),
+      fullName: reg.fullName || req.userToken.name || "",
+      college: reg.college || "",
+      role: "captain",
+      inviteStatus: "accepted",
+      invitedByUid: req.userToken.uid,
+      invitedAt: now,
+      respondedAt: now,
+      joinedAt: now,
+      updatedAt: now,
+    };
+
+    await adminDb.runTransaction(async (tx) => {
+      tx.set(teamRef, teamPayload);
+      tx.set(teamRef.collection("members").doc(String(captainMember.regId)), captainMember);
+    });
+
+    await writeAdminAuditLog("team_created", {
+      source: "teams_create_api",
+      actorEmail: normalize(req.userToken.email || ""),
+      teamId: teamRef.id,
+      eventId,
+      captainRegId: reg.regId || reg.id,
+    });
+
+    const bundle = await loadTeamWithMembers(teamRef.id);
+    res.json({ ok: true, team: bundle?.team || { id: teamRef.id, ...teamPayload }, members: bundle?.members || [captainMember] });
+  } catch (err) {
+    console.error("Create team failed:", err);
+    res.status(500).json({ error: err?.message || "Failed to create team" });
+  }
+});
+
+app.post("/teams/invite-member", requireUser, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const teamId = String(req.body?.teamId || "").trim();
+    const memberIdentity = String(req.body?.memberIdentity || "").trim();
+    if (!teamId || !memberIdentity) return res.status(400).json({ error: "teamId and memberIdentity are required" });
+
+    const teamRef = teamCollection().doc(teamId);
+    const teamSnap = await teamRef.get();
+    if (!teamSnap.exists) return res.status(404).json({ error: "Team not found" });
+    const team = teamSnap.data() || {};
+    if (team.captainUid !== req.userToken.uid) return res.status(403).json({ error: "Only captain can invite members" });
+    if ((team.paymentStatus || "") === "paid" || (team.status || "").includes("registered")) {
+      return res.status(400).json({ error: "Team is locked after registration" });
+    }
+
+    const targetReg = await getRegistrationByRegIdOrEmail(memberIdentity);
+    if (!targetReg) return res.status(404).json({ error: "Member fest registration not found" });
+    if ((targetReg.uid || "") === req.userToken.uid) return res.status(400).json({ error: "Captain is already in the team" });
+
+    const conflicting = await userAlreadyInTeamForEvent(targetReg.uid, team.eventId);
+    if (conflicting) {
+      const conflictTeamId = conflicting.data()?.teamId || conflicting.ref.parent?.parent?.id || null;
+      if (conflictTeamId && conflictTeamId !== teamId) {
+        return res.status(409).json({ error: "Member is already in another team for this event" });
+      }
+    }
+
+    const memberRef = teamRef.collection("members").doc(String(targetReg.regId || targetReg.id));
+
+    await adminDb.runTransaction(async (tx) => {
+      const [freshTeamSnap, memberSnap, allMembersSnap] = await Promise.all([
+        tx.get(teamRef),
+        tx.get(memberRef),
+        tx.get(teamRef.collection("members")),
+      ]);
+      if (!freshTeamSnap.exists) throw new Error("Team not found");
+      const freshTeam = freshTeamSnap.data() || {};
+      const members = allMembersSnap.docs.map((d) => d.data() || {});
+      const acceptedCount = members.filter((m) => m.inviteStatus === "accepted").length;
+      const invitedCount = members.filter((m) => m.inviteStatus === "invited").length;
+      const currentActiveCount = acceptedCount + invitedCount;
+      const maxSize = Number(freshTeam.maxSize || freshTeam.targetSize || 0);
+      if (maxSize > 0 && currentActiveCount >= maxSize && !memberSnap.exists) {
+        throw new Error("Team is full");
+      }
+
+      tx.set(memberRef, {
+        teamId,
+        eventId: freshTeam.eventId,
+        regId: targetReg.regId || targetReg.id,
+        uid: targetReg.uid || null,
+        email: normalize(targetReg.email || ""),
+        fullName: targetReg.fullName || "",
+        college: targetReg.college || "",
+        role: "member",
+        inviteStatus: "invited",
+        invitedByUid: req.userToken.uid,
+        invitedAt: admin.firestore.FieldValue.serverTimestamp(),
+        respondedAt: null,
+        joinedAt: null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      tx.update(teamRef, {
+        status: "inviting",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    const bundle = await loadTeamWithMembers(teamId);
+    res.json({ ok: true, team: bundle?.team, members: bundle?.members });
+  } catch (err) {
+    console.error("Invite member failed:", err);
+    res.status(500).json({ error: err?.message || "Failed to invite member" });
+  }
+});
+
+app.post("/teams/respond-invite", requireUser, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const teamId = String(req.body?.teamId || "").trim();
+    const action = String(req.body?.action || "").trim().toLowerCase();
+    if (!teamId || !["accept", "reject"].includes(action)) {
+      return res.status(400).json({ error: "teamId and valid action are required" });
+    }
+
+    const regSnap = await adminDb.collection("registrations").where("uid", "==", req.userToken.uid).limit(1).get();
+    if (regSnap.empty) return res.status(400).json({ error: "Fest registration required" });
+    const reg = { id: regSnap.docs[0].id, ...regSnap.docs[0].data() };
+    const memberRef = teamCollection().doc(teamId).collection("members").doc(String(reg.regId || reg.id));
+    const teamRef = teamCollection().doc(teamId);
+    const teamSnapPre = await teamRef.get();
+    if (!teamSnapPre.exists) return res.status(404).json({ error: "Team not found" });
+    const preTeam = teamSnapPre.data() || {};
+    const existingMembershipElsewhere = action === "accept"
+      ? await userAlreadyInTeamForEvent(req.userToken.uid, preTeam.eventId || "")
+      : null;
+
+    await adminDb.runTransaction(async (tx) => {
+      const [teamSnap, memberSnap, allMembersSnap] = await Promise.all([
+        tx.get(teamRef),
+        tx.get(memberRef),
+        tx.get(teamRef.collection("members")),
+      ]);
+      if (!teamSnap.exists) throw new Error("Team not found");
+      if (!memberSnap.exists) throw new Error("Invite not found");
+      const team = teamSnap.data() || {};
+      const member = memberSnap.data() || {};
+      if (member.role === "captain") throw new Error("Captain cannot respond to invite");
+      if (member.uid && member.uid !== req.userToken.uid) throw new Error("Invite owner mismatch");
+      if (member.inviteStatus !== "invited" && action === "accept") throw new Error("Invite is not pending");
+      if ((team.paymentStatus || "") === "paid") throw new Error("Team is locked");
+
+      if (action === "accept") {
+        const conflict = allMembersSnap.docs.find((d) => {
+          const data = d.data() || {};
+          return data.uid === req.userToken.uid && d.id !== memberSnap.id && ["accepted", "invited"].includes(String(data.inviteStatus || ""));
+        });
+        if (conflict) throw new Error("Duplicate team membership");
+        const otherTeamId = existingMembershipElsewhere?.data()?.teamId || existingMembershipElsewhere?.ref?.parent?.parent?.id || null;
+        if (otherTeamId && otherTeamId !== teamId) throw new Error("You are already in another team for this event");
+      }
+
+      tx.update(memberRef, {
+        inviteStatus: action === "accept" ? "accepted" : "declined",
+        respondedAt: admin.firestore.FieldValue.serverTimestamp(),
+        joinedAt: action === "accept" ? admin.firestore.FieldValue.serverTimestamp() : null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      const membersAfter = allMembersSnap.docs.map((d) => (d.id === memberSnap.id
+        ? { ...(d.data() || {}), inviteStatus: action === "accept" ? "accepted" : "declined" }
+        : (d.data() || {})));
+      const acceptedCount = membersAfter.filter((m) => m.inviteStatus === "accepted").length;
+      const pendingCount = membersAfter.filter((m) => m.inviteStatus === "invited").length;
+      const target = Number(team.targetSize || team.maxSize || 0);
+      const nextStatus = acceptedCount >= target && pendingCount === 0 ? "ready_for_payment" : "inviting";
+
+      tx.update(teamRef, {
+        memberCount: acceptedCount,
+        status: nextStatus,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    const bundle = await loadTeamWithMembers(teamId);
+    res.json({ ok: true, action, team: bundle?.team, members: bundle?.members });
+  } catch (err) {
+    console.error("Respond invite failed:", err);
+    res.status(500).json({ error: err?.message || "Failed to respond to invite" });
   }
 });
 
