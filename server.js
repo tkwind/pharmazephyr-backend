@@ -478,10 +478,118 @@ function deriveTeamStatus(team, members = []) {
   const accepted = members.filter((m) => m.inviteStatus === "accepted").length;
   const pending = members.filter((m) => m.inviteStatus === "invited").length;
   const target = Number(team.targetSize || team.maxSize || 0);
-  if ((team.paymentStatus || "") === "paid") return "registered";
+  if ((team.status || "") === "registered" || (team.paymentStatus || "") === "paid") return "registered";
   if (target > 0 && accepted >= target && pending === 0) return "ready_for_payment";
   if (pending > 0 || accepted > 0) return "inviting";
   return "draft";
+}
+
+async function registerAcceptedTeamMembersForEvent({
+  tx,
+  teamRef,
+  team,
+  members,
+  eventConfig,
+  razorpayOrderId = null,
+  razorpayPaymentId = null,
+}) {
+  const acceptedMembers = members.filter((m) => m.inviteStatus === "accepted");
+  const eventId = String(team.eventId || "");
+  const category = String(team.category || eventConfig?.publicCategory || eventConfig?.category || "events");
+  const eventName = String(team.eventName || eventConfig?.name || "Event");
+  const eventDesc = String(eventConfig?.desc || "");
+  const eventPrice = String(team.eventPrice || eventConfig?.priceLabel || "—");
+  const teamAmount = parseAmount(team.amount ?? eventConfig?.amount ?? 0);
+  const eventRegistryRef = adminDb.collection("eventsRegistry").doc(eventId);
+
+  tx.set(eventRegistryRef, {
+    eventId,
+    category,
+    name: eventName,
+    desc: eventDesc,
+    priceLabel: eventPrice,
+    amount: teamAmount,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
+
+  for (const member of acceptedMembers) {
+    const regId = String(member.regId || "").trim();
+    if (!regId) continue;
+    const regRef = adminDb.collection("registrations").doc(regId);
+    const participantRef = eventRegistryRef.collection("participants").doc(regId);
+    const eventRegistrationRef = adminDb.collection("eventRegistrations").doc(makeEventRegistrationDocId(regId, eventId));
+
+    const regSnap = await tx.get(regRef);
+    if (!regSnap.exists) continue;
+    const reg = regSnap.data() || {};
+    const current = Array.isArray(reg.registeredEvents) ? reg.registeredEvents : [];
+    if (!current.some((x) => x?.id === eventId)) {
+      tx.update(regRef, {
+        registeredEvents: [
+          ...current,
+          {
+            id: eventId,
+            category,
+            name: eventName,
+            desc: eventDesc,
+            price: eventPrice,
+            teamId: team.teamId || teamRef.id,
+            teamName: team.teamName || "",
+            role: member.role || "member",
+            registeredAt: admin.firestore.Timestamp.now(),
+          },
+        ],
+      });
+    }
+
+    tx.set(participantRef, {
+      regId,
+      uid: reg.uid || member.uid || null,
+      email: reg.email || member.email || null,
+      fullName: reg.fullName || member.fullName || "",
+      college: reg.college || member.college || "",
+      phone: reg.phone || "",
+      eventId,
+      category,
+      eventName,
+      eventPrice,
+      amount: 0,
+      status: "registered",
+      source: "team_server",
+      teamId: team.teamId || teamRef.id,
+      teamName: team.teamName || "",
+      teamRole: member.role || "member",
+      registeredAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    tx.set(eventRegistrationRef, {
+      registrationDocId: makeEventRegistrationDocId(regId, eventId),
+      regId,
+      uid: reg.uid || member.uid || null,
+      email: reg.email || member.email || "",
+      fullName: reg.fullName || member.fullName || "",
+      college: reg.college || member.college || "",
+      phone: reg.phone || "",
+      eventId,
+      category,
+      eventName,
+      eventDesc,
+      eventPrice,
+      amount: 0,
+      teamId: team.teamId || teamRef.id,
+      teamName: team.teamName || "",
+      teamRole: member.role || "member",
+      teamPaymentAmount: teamAmount,
+      paymentRequired: teamAmount > 0,
+      paymentStatus: teamAmount > 0 ? "paid" : "not_required",
+      status: "registered",
+      source: "team_server",
+      razorpayOrderId: razorpayOrderId || null,
+      razorpayPaymentId: razorpayPaymentId || null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }
 }
 
 app.post("/create-order", async (req, res) => {
@@ -681,6 +789,8 @@ app.post("/teams/create", requireUser, requireFirebaseAdmin, async (req, res) =>
       eventId,
       eventName: String(event.name || req.body?.eventName || "Event"),
       category: String(event.publicCategory || event.category || req.body?.category || "events"),
+      eventPrice: String(event.priceLabel || "—"),
+      amount: parseAmount(event.amount),
       eventRegistrationType: normalizeTeamMode(event),
       captainUid: req.userToken.uid,
       captainRegId: reg.regId || reg.id,
@@ -887,6 +997,128 @@ app.post("/teams/respond-invite", requireUser, requireFirebaseAdmin, async (req,
   }
 });
 
+app.post("/teams/finalize-payment", requireUser, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const teamId = String(req.body?.teamId || "").trim();
+    const orderId = String(req.body?.orderId || "").trim();
+    const paymentId = String(req.body?.paymentId || "").trim();
+    const signature = String(req.body?.signature || "").trim();
+    if (!teamId) return res.status(400).json({ error: "teamId is required" });
+
+    const teamRef = teamCollection().doc(teamId);
+    const [teamSnap, eventSnap] = await Promise.all([
+      teamRef.get(),
+      (async () => {
+        const t = await teamRef.get();
+        if (!t.exists) return null;
+        const data = t.data() || {};
+        if (!data.eventId) return null;
+        return adminDb.collection("events").doc(String(data.eventId)).get();
+      })(),
+    ]);
+    if (!teamSnap.exists) return res.status(404).json({ error: "Team not found" });
+    const team = teamSnap.data() || {};
+    if (String(team.captainUid || "") !== String(req.userToken.uid || "")) {
+      return res.status(403).json({ error: "Only captain can pay for the team" });
+    }
+
+    const eventConfig = eventSnap?.exists ? (eventSnap.data() || {}) : {};
+    const teamAmount = parseAmount(team.amount ?? eventConfig?.amount ?? 0);
+    if (teamAmount > 0) {
+      if (!orderId || !paymentId || !signature) {
+        return res.status(400).json({ error: "Missing payment proof" });
+      }
+      if (!verifyRazorpaySignature(orderId, paymentId, signature)) {
+        return res.status(400).json({ error: "Invalid Razorpay signature" });
+      }
+    }
+
+    let alreadyPaid = false;
+    await adminDb.runTransaction(async (tx) => {
+      const [freshTeamSnap, membersSnap] = await Promise.all([
+        tx.get(teamRef),
+        tx.get(teamRef.collection("members")),
+      ]);
+      if (!freshTeamSnap.exists) throw new Error("Team not found");
+      const freshTeam = freshTeamSnap.data() || {};
+      if (String(freshTeam.captainUid || "") !== String(req.userToken.uid || "")) {
+        throw new Error("Only captain can pay for the team");
+      }
+      if ((freshTeam.paymentStatus || "") === "paid") {
+        alreadyPaid = true;
+        return;
+      }
+
+      const members = membersSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      const accepted = members.filter((m) => m.inviteStatus === "accepted");
+      const pending = members.filter((m) => m.inviteStatus === "invited");
+      const target = Number(freshTeam.targetSize || freshTeam.maxSize || 0);
+      if (!accepted.length) throw new Error("No accepted team members");
+      if (target > 0 && accepted.length < target) {
+        throw new Error(`Team roster incomplete (${accepted.length}/${target})`);
+      }
+      if (pending.length > 0) {
+        throw new Error("Pending invites must be resolved before payment");
+      }
+
+      await registerAcceptedTeamMembersForEvent({
+        tx,
+        teamRef,
+        team: { ...freshTeam, teamId: freshTeam.teamId || teamRef.id },
+        members,
+        eventConfig,
+        razorpayOrderId: orderId || null,
+        razorpayPaymentId: paymentId || null,
+      });
+
+      tx.set(teamRef, {
+        status: "registered",
+        paymentStatus: teamAmount > 0 ? "paid" : "not_required",
+        memberCount: accepted.length,
+        paidAt: teamAmount > 0 ? admin.firestore.FieldValue.serverTimestamp() : null,
+        razorpayOrderId: orderId || null,
+        razorpayPaymentId: paymentId || null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    });
+
+    if (teamAmount > 0 && paymentId) {
+      try {
+        await reconcileEventPayment({
+          paymentId: paymentId || null,
+          orderId: orderId || null,
+          source: "team_finalize_api",
+        });
+      } catch (err) {
+        console.error("Team payment reconcile warning:", err);
+      }
+    }
+
+    await writeAdminAuditLog("team_payment_finalize", {
+      source: "teams_finalize_payment_api",
+      actorEmail: normalize(req.userToken.email || ""),
+      teamId,
+      orderId: orderId || null,
+      paymentId: paymentId || null,
+      alreadyPaid,
+    });
+
+    const bundle = await loadTeamWithMembers(teamId);
+    const derivedStatus = bundle ? deriveTeamStatus(bundle.team, bundle.members) : null;
+    res.json({
+      ok: true,
+      alreadyPaid,
+      team: bundle?.team || { id: teamId, ...team },
+      members: bundle?.members || [],
+      derivedStatus,
+      paymentStatus: teamAmount > 0 ? "paid" : "not_required",
+    });
+  } catch (err) {
+    console.error("Team finalize payment failed:", err);
+    res.status(500).json({ error: err?.message || "Failed to finalize team payment" });
+  }
+});
+
 app.get("/admin/summary", requireAdmin, requireFirebaseAdmin, async (_req, res) => {
   try {
     const [fest, events, paid, pending] = await Promise.all([
@@ -929,6 +1161,50 @@ app.get("/admin/event-registrations", requireAdmin, requireFirebaseAdmin, async 
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to load event registrations" });
+  }
+});
+
+app.get("/admin/teams", requireAdmin, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const limitN = Math.min(500, Math.max(1, Number(req.query.limit || 200)));
+    const snap = await adminDb.collection("teams").orderBy("createdAt", "desc").limit(limitN).get();
+    const rows = await Promise.all(snap.docs.map(async (teamDoc) => {
+      const team = { id: teamDoc.id, ...teamDoc.data() };
+      const membersSnap = await teamDoc.ref.collection("members").get();
+      const members = membersSnap.docs.map(mapDoc);
+      return { ...team, members };
+    }));
+    res.json({ ok: true, rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to load teams" });
+  }
+});
+
+app.post("/admin/team-status", requireAdmin, requireFirebaseAdmin, async (req, res) => {
+  try {
+    const teamId = String(req.body?.teamId || "").trim();
+    const status = req.body?.status == null ? null : String(req.body.status).trim();
+    const paymentStatus = req.body?.paymentStatus == null ? null : String(req.body.paymentStatus).trim();
+    if (!teamId) return res.status(400).json({ error: "teamId is required" });
+    if (!status && !paymentStatus) return res.status(400).json({ error: "No team updates provided" });
+
+    const update = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+    if (status) update.status = status;
+    if (paymentStatus) update.paymentStatus = paymentStatus;
+
+    await adminDb.collection("teams").doc(teamId).set(update, { merge: true });
+    await writeAdminAuditLog("admin_team_status_update", {
+      source: "admin_team_status_api",
+      actorEmail: normalize(req.adminUser?.email || ""),
+      teamId,
+      status: status || null,
+      paymentStatus: paymentStatus || null,
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to update team status" });
   }
 });
 
