@@ -1426,6 +1426,21 @@ app.get("/admin/team-detail", requireAdmin, requireFirebaseAdmin, async (req, re
     if (!bundle) return res.status(404).json({ error: "Team not found" });
     const team = bundle.team;
     const members = bundle.members;
+    const eventId = String(team.eventId || "");
+    const syncChecks = await Promise.all(members.map(async (member) => {
+      const regId = String(member.regId || "").trim();
+      if (!regId || !eventId) {
+        return { linked: false, docId: null };
+      }
+      const docId = makeEventRegistrationDocId(regId, eventId);
+      const snap = await adminDb.collection("eventRegistrations").doc(docId).get();
+      return { linked: snap.exists, docId };
+    }));
+    const enrichedMembers = members.map((member, index) => ({
+      ...member,
+      eventRegistrationLinked: !!syncChecks[index]?.linked,
+      eventRegistrationDocId: syncChecks[index]?.docId || null,
+    }));
     const derivedStatus = deriveTeamStatus(team, members);
     res.json({
       ok: true,
@@ -1434,7 +1449,7 @@ app.get("/admin/team-detail", requireAdmin, requireFirebaseAdmin, async (req, re
         derivedStatus,
         memberCounts: teamCountsFromMembers(members),
       },
-      members,
+      members: enrichedMembers,
     });
   } catch (err) {
     console.error("Admin team detail failed:", err);
