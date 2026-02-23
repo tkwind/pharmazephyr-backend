@@ -63,9 +63,11 @@ function initFirebaseAdmin() {
 
 const firebaseApp = initFirebaseAdmin();
 const adminDb = firebaseApp ? admin.firestore() : null;
+const MAIL_PROVIDER = String(process.env.MAIL_PROVIDER || "").trim().toLowerCase() || "smtp";
 const MAIL_FROM = String(process.env.MAIL_FROM || "").trim();
 const MAIL_REPLY_TO = String(process.env.MAIL_REPLY_TO || "").trim();
 const MAIL_ENABLED = String(process.env.MAIL_ENABLED || "true").trim().toLowerCase() !== "false";
+const RESEND_API_KEY = String(process.env.RESEND_API_KEY || "").trim();
 const SMTP_HOST = String(process.env.SMTP_HOST || "").trim().replace(/^\s*smtps?:\/\//i, "");
 const SMTP_PORT = Number(String(process.env.SMTP_PORT || "587").trim() || 587);
 const SMTP_SECURE = String(process.env.SMTP_SECURE || "").trim().toLowerCase() === "true" || SMTP_PORT === 465;
@@ -75,6 +77,17 @@ let mailTransporter = null;
 
 function hasSmtpConfig() {
   return !!(SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS && MAIL_FROM);
+}
+
+function hasResendConfig() {
+  return !!(RESEND_API_KEY && MAIL_FROM);
+}
+
+function activeMailProvider() {
+  if (MAIL_PROVIDER === "resend") return "resend";
+  if (MAIL_PROVIDER === "smtp") return "smtp";
+  if (hasResendConfig()) return "resend";
+  return "smtp";
 }
 
 function getMailTransporter() {
@@ -141,6 +154,7 @@ app.post("/razorpay/webhook", express.raw({ type: "application/json" }), async (
 app.use(express.json());
 
 app.get("/health", (_req, res) => {
+  const provider = activeMailProvider();
   res.json({
     ok: true,
     service: "pharmazephyr-razorpay",
@@ -148,10 +162,11 @@ app.get("/health", (_req, res) => {
     firebaseAdmin: !!adminDb,
     mail: {
       enabled: MAIL_ENABLED,
-      configured: hasSmtpConfig(),
-      host: SMTP_HOST || null,
-      port: Number.isFinite(SMTP_PORT) ? SMTP_PORT : null,
-      secure: SMTP_SECURE,
+      provider,
+      configured: provider === "resend" ? hasResendConfig() : hasSmtpConfig(),
+      host: provider === "smtp" ? (SMTP_HOST || null) : "api.resend.com",
+      port: provider === "smtp" ? (Number.isFinite(SMTP_PORT) ? SMTP_PORT : null) : 443,
+      secure: provider === "smtp" ? SMTP_SECURE : true,
       fromConfigured: !!MAIL_FROM,
     },
   });
@@ -194,13 +209,15 @@ function emailDocKey(type, key) {
 }
 
 async function sendTransactionalEmail({ type, dedupeKey, to, subject, html, text, meta = {} }) {
-  const transporter = getMailTransporter();
+  const provider = activeMailProvider();
+  const transporter = provider === "smtp" ? getMailTransporter() : null;
   const recipient = String(to || "").trim();
   const emailKey = emailDocKey(type, dedupeKey);
 
   if (!recipient) return { ok: false, skipped: true, reason: "missing_recipient" };
   if (!MAIL_ENABLED) return { ok: false, skipped: true, reason: "mail_disabled" };
-  if (!transporter) return { ok: false, skipped: true, reason: "smtp_not_configured" };
+  if (provider === "smtp" && !transporter) return { ok: false, skipped: true, reason: "smtp_not_configured" };
+  if (provider === "resend" && !hasResendConfig()) return { ok: false, skipped: true, reason: "resend_not_configured" };
   if (!adminDb) return { ok: false, skipped: true, reason: "firebase_admin_unavailable" };
 
   const ref = adminDb.collection("transactionalEmails").doc(emailKey);
@@ -230,24 +247,51 @@ async function sendTransactionalEmail({ type, dedupeKey, to, subject, html, text
   if (!shouldSend) return { ok: true, duplicate: true };
 
   try {
-    const info = await transporter.sendMail({
-      from: MAIL_FROM,
-      to: recipient,
-      replyTo: MAIL_REPLY_TO || undefined,
-      subject,
-      text,
-      html,
-    });
+    let messageId = null;
+
+    if (provider === "resend") {
+      const resendRes = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${RESEND_API_KEY}`,
+        },
+        body: JSON.stringify({
+          from: MAIL_FROM,
+          to: [recipient],
+          reply_to: MAIL_REPLY_TO || undefined,
+          subject,
+          html,
+          text,
+        }),
+      });
+      const resendData = await resendRes.json().catch(() => ({}));
+      if (!resendRes.ok) {
+        const apiErr = resendData?.message || resendData?.error || `HTTP ${resendRes.status}`;
+        throw new Error(`Resend API error: ${apiErr}`);
+      }
+      messageId = resendData?.id || null;
+    } else {
+      const info = await transporter.sendMail({
+        from: MAIL_FROM,
+        to: recipient,
+        replyTo: MAIL_REPLY_TO || undefined,
+        subject,
+        text,
+        html,
+      });
+      messageId = info?.messageId || null;
+    }
 
     await ref.set({
       status: "sent",
-      provider: "smtp",
-      messageId: info?.messageId || null,
+      provider,
+      messageId,
       sentAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
 
-    return { ok: true, messageId: info?.messageId || null };
+    return { ok: true, provider, messageId };
   } catch (err) {
     console.error("Email send failed:", err);
     await ref.set({
