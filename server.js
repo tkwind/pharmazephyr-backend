@@ -415,6 +415,49 @@ function mapDoc(docSnap) {
   return { id: docSnap.id, ...docSnap.data() };
 }
 
+function decodePageCursor(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(String(raw), "base64").toString("utf8"));
+    const createdAtMs = Number(parsed?.createdAtMs);
+    const id = String(parsed?.id || "");
+    if (!Number.isFinite(createdAtMs) || !id) return null;
+    return { createdAtMs, id };
+  } catch {
+    return null;
+  }
+}
+
+function encodePageCursor(docSnap) {
+  const data = docSnap.data() || {};
+  const seconds = Number(data?.createdAt?.seconds || 0);
+  const nanos = Number(data?.createdAt?.nanoseconds || 0);
+  const createdAtMs = seconds ? (seconds * 1000 + Math.floor(nanos / 1e6)) : 0;
+  return Buffer.from(JSON.stringify({ createdAtMs, id: docSnap.id }), "utf8").toString("base64");
+}
+
+async function getPagedDocs(collectionRef, { limitN, cursor }) {
+  let q = collectionRef
+    .orderBy("createdAt", "desc")
+    .orderBy(admin.firestore.FieldPath.documentId(), "desc")
+    .limit(limitN + 1);
+
+  if (cursor?.createdAtMs && cursor?.id) {
+    q = q.startAfter(admin.firestore.Timestamp.fromMillis(cursor.createdAtMs), cursor.id);
+  }
+
+  const snap = await q.get();
+  const hasMore = snap.docs.length > limitN;
+  const docs = hasMore ? snap.docs.slice(0, limitN) : snap.docs;
+  return {
+    docs,
+    pageInfo: {
+      hasMore,
+      nextCursor: hasMore && docs.length ? encodePageCursor(docs[docs.length - 1]) : null,
+    },
+  };
+}
+
 function isTeamParticipationMode(eventConfig = {}) {
   const mode = String(eventConfig?.participationMode || "").trim().toLowerCase();
   const teamSize = Number(eventConfig?.teamSize || 0);
@@ -1355,8 +1398,9 @@ app.get("/admin/summary", requireAdmin, requireFirebaseAdmin, async (_req, res) 
 app.get("/admin/fest-registrations", requireAdmin, requireFirebaseAdmin, async (req, res) => {
   try {
     const limitN = Math.min(1000, Math.max(1, Number(req.query.limit || 500)));
-    const snap = await adminDb.collection("registrations").orderBy("createdAt", "desc").limit(limitN).get();
-    res.json({ ok: true, rows: snap.docs.map(mapDoc) });
+    const cursor = decodePageCursor(req.query.cursor);
+    const { docs, pageInfo } = await getPagedDocs(adminDb.collection("registrations"), { limitN, cursor });
+    res.json({ ok: true, rows: docs.map(mapDoc), pageInfo });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to load fest registrations" });
@@ -1366,8 +1410,9 @@ app.get("/admin/fest-registrations", requireAdmin, requireFirebaseAdmin, async (
 app.get("/admin/event-registrations", requireAdmin, requireFirebaseAdmin, async (req, res) => {
   try {
     const limitN = Math.min(2000, Math.max(1, Number(req.query.limit || 1000)));
-    const snap = await adminDb.collection("eventRegistrations").orderBy("createdAt", "desc").limit(limitN).get();
-    res.json({ ok: true, rows: snap.docs.map(mapDoc) });
+    const cursor = decodePageCursor(req.query.cursor);
+    const { docs, pageInfo } = await getPagedDocs(adminDb.collection("eventRegistrations"), { limitN, cursor });
+    res.json({ ok: true, rows: docs.map(mapDoc), pageInfo });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to load event registrations" });
@@ -1377,14 +1422,15 @@ app.get("/admin/event-registrations", requireAdmin, requireFirebaseAdmin, async 
 app.get("/admin/teams", requireAdmin, requireFirebaseAdmin, async (req, res) => {
   try {
     const limitN = Math.min(500, Math.max(1, Number(req.query.limit || 200)));
-    const snap = await adminDb.collection("teams").orderBy("createdAt", "desc").limit(limitN).get();
-    const rows = await Promise.all(snap.docs.map(async (teamDoc) => {
+    const cursor = decodePageCursor(req.query.cursor);
+    const { docs, pageInfo } = await getPagedDocs(adminDb.collection("teams"), { limitN, cursor });
+    const rows = await Promise.all(docs.map(async (teamDoc) => {
       const team = { id: teamDoc.id, ...teamDoc.data() };
       const membersSnap = await teamDoc.ref.collection("members").get();
       const members = membersSnap.docs.map(mapDoc);
       return { ...team, members };
     }));
-    res.json({ ok: true, rows });
+    res.json({ ok: true, rows, pageInfo });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to load teams" });
@@ -1951,8 +1997,9 @@ app.post("/admin/event-payment-status", requireAdmin, requireFirebaseAdmin, asyn
 app.get("/admin/audit-logs", requireAdmin, requireFirebaseAdmin, async (req, res) => {
   try {
     const limitN = Math.min(200, Math.max(1, Number(req.query.limit || 100)));
-    const snap = await adminDb.collection("adminAuditLogs").orderBy("createdAt", "desc").limit(limitN).get();
-    res.json({ ok: true, rows: snap.docs.map(mapDoc) });
+    const cursor = decodePageCursor(req.query.cursor);
+    const { docs, pageInfo } = await getPagedDocs(adminDb.collection("adminAuditLogs"), { limitN, cursor });
+    res.json({ ok: true, rows: docs.map(mapDoc), pageInfo });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to load audit logs" });
