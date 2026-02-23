@@ -28,13 +28,6 @@ function parseAmount(value) {
   return Number.isFinite(n) && n >= 0 ? n : 0;
 }
 
-function parseMillisTimestamp(value) {
-  if (value == null || value === "") return null;
-  const n = Number(value);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  return admin.firestore.Timestamp.fromMillis(Math.trunc(n));
-}
-
 function verifyRazorpaySignature(orderId, paymentId, signature) {
   const body = `${orderId}|${paymentId}`;
   const expected = crypto
@@ -118,34 +111,6 @@ app.get("/health", (_req, res) => {
     at: Date.now(),
     firebaseAdmin: !!adminDb,
   });
-});
-
-app.get("/announcements/public", async (_req, res) => {
-  try {
-    if (!adminDb) return res.status(503).json({ error: "Firebase Admin not configured" });
-    const snap = await adminDb.collection("announcements")
-      .where("published", "==", true)
-      .orderBy("updatedAt", "desc")
-      .limit(10)
-      .get();
-
-    const nowMs = Date.now();
-    const rows = snap.docs
-      .map(mapDoc)
-      .filter((row) => {
-        const startsMs = row?.startsAt?.seconds ? row.startsAt.seconds * 1000 : null;
-        const endsMs = row?.endsAt?.seconds ? row.endsAt.seconds * 1000 : null;
-        if (startsMs && startsMs > nowMs) return false;
-        if (endsMs && endsMs < nowMs) return false;
-        return true;
-      })
-      .sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0));
-
-    res.json({ ok: true, rows });
-  } catch (err) {
-    console.error("Public announcements failed:", err);
-    res.status(500).json({ error: "Failed to load announcements" });
-  }
 });
 
 const razorpay = new Razorpay({
@@ -1825,98 +1790,6 @@ app.get("/admin/events", requireAdmin, requireFirebaseAdmin, async (_req, res) =
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to load events config" });
-  }
-});
-
-app.get("/admin/announcements", requireAdmin, requireFirebaseAdmin, async (req, res) => {
-  try {
-    const limitN = Math.min(300, Math.max(1, Number(req.query.limit || 100)));
-    const cursor = decodePageCursor(req.query.cursor);
-    const { docs, pageInfo } = await getPagedDocs(adminDb.collection("announcements"), { limitN, cursor });
-    res.json({ ok: true, rows: docs.map(mapDoc), pageInfo });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to load announcements" });
-  }
-});
-
-app.post("/admin/announcements/upsert", requireAdmin, requireFirebaseAdmin, async (req, res) => {
-  try {
-    const {
-      announcementId = "",
-      title = "",
-      message = "",
-      type = "info",
-      scope = "all",
-      eventId = "",
-      published = false,
-      priority = 0,
-      startsAtMs = null,
-      endsAtMs = null,
-    } = req.body || {};
-
-    const cleanTitle = String(title || "").trim();
-    const cleanMessage = String(message || "").trim();
-    if (!cleanTitle || !cleanMessage) {
-      return res.status(400).json({ error: "title and message are required" });
-    }
-
-    const ref = String(announcementId || "").trim()
-      ? adminDb.collection("announcements").doc(String(announcementId).trim())
-      : adminDb.collection("announcements").doc();
-
-    const startsAt = parseMillisTimestamp(startsAtMs);
-    const endsAt = parseMillisTimestamp(endsAtMs);
-
-    const payload = {
-      announcementId: ref.id,
-      title: cleanTitle,
-      message: cleanMessage,
-      type: String(type || "info").trim().toLowerCase(),
-      scope: String(scope || "all").trim().toLowerCase(),
-      eventId: String(eventId || "").trim() || null,
-      published: !!published,
-      priority: Number.isFinite(Number(priority)) ? Number(priority) : 0,
-      startsAt,
-      endsAt,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedBy: normalize(req.adminUser?.email || ""),
-    };
-
-    const existing = await ref.get();
-    if (!existing.exists) {
-      payload.createdAt = admin.firestore.FieldValue.serverTimestamp();
-      payload.createdBy = normalize(req.adminUser?.email || "");
-    }
-
-    await ref.set(payload, { merge: true });
-    await writeAdminAuditLog("admin_announcement_upsert", {
-      source: "admin_announcements_api",
-      actorEmail: normalize(req.adminUser?.email || ""),
-      announcementId: ref.id,
-      published: !!published,
-    });
-    res.json({ ok: true, id: ref.id });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to save announcement" });
-  }
-});
-
-app.post("/admin/announcements/delete", requireAdmin, requireFirebaseAdmin, async (req, res) => {
-  try {
-    const announcementId = String(req.body?.announcementId || "").trim();
-    if (!announcementId) return res.status(400).json({ error: "announcementId is required" });
-    await adminDb.collection("announcements").doc(announcementId).delete();
-    await writeAdminAuditLog("admin_announcement_delete", {
-      source: "admin_announcements_api",
-      actorEmail: normalize(req.adminUser?.email || ""),
-      announcementId,
-    });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to delete announcement" });
   }
 });
 
