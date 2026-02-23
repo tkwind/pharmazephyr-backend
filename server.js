@@ -4,7 +4,6 @@ import crypto from "crypto";
 import cors from "cors";
 import dotenv from "dotenv";
 import admin from "firebase-admin";
-import nodemailer from "nodemailer";
 
 dotenv.config();
 
@@ -63,54 +62,6 @@ function initFirebaseAdmin() {
 
 const firebaseApp = initFirebaseAdmin();
 const adminDb = firebaseApp ? admin.firestore() : null;
-const MAIL_PROVIDER = String(process.env.MAIL_PROVIDER || "").trim().toLowerCase() || "smtp";
-const MAIL_FROM = String(process.env.MAIL_FROM || "").trim();
-const MAIL_REPLY_TO = String(process.env.MAIL_REPLY_TO || "").trim();
-const MAIL_ENABLED = String(process.env.MAIL_ENABLED || "true").trim().toLowerCase() !== "false";
-const RESEND_API_KEY = String(process.env.RESEND_API_KEY || "").trim();
-const SMTP_HOST = String(process.env.SMTP_HOST || "").trim().replace(/^\s*smtps?:\/\//i, "");
-const SMTP_PORT = Number(String(process.env.SMTP_PORT || "587").trim() || 587);
-const SMTP_SECURE = String(process.env.SMTP_SECURE || "").trim().toLowerCase() === "true" || SMTP_PORT === 465;
-const SMTP_USER = String(process.env.SMTP_USER || "").trim();
-const SMTP_PASS = String(process.env.SMTP_PASS || "");
-let mailTransporter = null;
-
-function hasSmtpConfig() {
-  return !!(SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS && MAIL_FROM);
-}
-
-function hasResendConfig() {
-  return !!(RESEND_API_KEY && MAIL_FROM);
-}
-
-function activeMailProvider() {
-  if (MAIL_PROVIDER === "resend") return "resend";
-  if (MAIL_PROVIDER === "smtp") return "smtp";
-  if (hasResendConfig()) return "resend";
-  return "smtp";
-}
-
-function getMailTransporter() {
-  if (!MAIL_ENABLED) return null;
-  if (!hasSmtpConfig()) return null;
-  if (mailTransporter) return mailTransporter;
-  mailTransporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_SECURE,
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS,
-    },
-    connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 15000),
-    greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT_MS || 10000),
-    socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT_MS || 20000),
-    tls: {
-      servername: SMTP_HOST,
-    },
-  });
-  return mailTransporter;
-}
 
 const app = express();
 app.use(cors());
@@ -154,21 +105,11 @@ app.post("/razorpay/webhook", express.raw({ type: "application/json" }), async (
 app.use(express.json());
 
 app.get("/health", (_req, res) => {
-  const provider = activeMailProvider();
   res.json({
     ok: true,
     service: "pharmazephyr-razorpay",
     at: Date.now(),
     firebaseAdmin: !!adminDb,
-    mail: {
-      enabled: MAIL_ENABLED,
-      provider,
-      configured: provider === "resend" ? hasResendConfig() : hasSmtpConfig(),
-      host: provider === "smtp" ? (SMTP_HOST || null) : "api.resend.com",
-      port: provider === "smtp" ? (Number.isFinite(SMTP_PORT) ? SMTP_PORT : null) : 443,
-      secure: provider === "smtp" ? SMTP_SECURE : true,
-      fromConfigured: !!MAIL_FROM,
-    },
   });
 });
 
@@ -200,172 +141,6 @@ async function writeAdminAuditLog(action, details = {}) {
   } catch (err) {
     console.error("Audit log write failed:", err);
   }
-}
-
-function emailDocKey(type, key) {
-  const a = String(type || "email").replace(/[^a-zA-Z0-9_-]/g, "_");
-  const b = String(key || "key").replace(/[^a-zA-Z0-9_-]/g, "_");
-  return `${a}__${b}`;
-}
-
-async function sendTransactionalEmail({ type, dedupeKey, to, subject, html, text, meta = {} }) {
-  const provider = activeMailProvider();
-  const transporter = provider === "smtp" ? getMailTransporter() : null;
-  const recipient = String(to || "").trim();
-  const emailKey = emailDocKey(type, dedupeKey);
-
-  if (!recipient) return { ok: false, skipped: true, reason: "missing_recipient" };
-  if (!MAIL_ENABLED) return { ok: false, skipped: true, reason: "mail_disabled" };
-  if (provider === "smtp" && !transporter) return { ok: false, skipped: true, reason: "smtp_not_configured" };
-  if (provider === "resend" && !hasResendConfig()) return { ok: false, skipped: true, reason: "resend_not_configured" };
-  if (!adminDb) return { ok: false, skipped: true, reason: "firebase_admin_unavailable" };
-
-  const ref = adminDb.collection("transactionalEmails").doc(emailKey);
-  let shouldSend = false;
-  try {
-    await adminDb.runTransaction(async (tx) => {
-      const snap = await tx.get(ref);
-      const existing = snap.exists ? (snap.data() || {}) : null;
-      if (existing?.status === "sent") return;
-      shouldSend = true;
-      tx.set(ref, {
-        type,
-        dedupeKey: String(dedupeKey || ""),
-        to: recipient,
-        subject: String(subject || ""),
-        status: "sending",
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        createdAt: existing?.createdAt || admin.firestore.FieldValue.serverTimestamp(),
-        meta,
-      }, { merge: true });
-    });
-  } catch (err) {
-    console.error("Email dedupe transaction failed:", err);
-    return { ok: false, skipped: true, reason: "dedupe_failed" };
-  }
-
-  if (!shouldSend) return { ok: true, duplicate: true };
-
-  try {
-    let messageId = null;
-
-    if (provider === "resend") {
-      const resendRes = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${RESEND_API_KEY}`,
-        },
-        body: JSON.stringify({
-          from: MAIL_FROM,
-          to: [recipient],
-          reply_to: MAIL_REPLY_TO || undefined,
-          subject,
-          html,
-          text,
-        }),
-      });
-      const resendData = await resendRes.json().catch(() => ({}));
-      if (!resendRes.ok) {
-        const apiErr = resendData?.message || resendData?.error || `HTTP ${resendRes.status}`;
-        throw new Error(`Resend API error: ${apiErr}`);
-      }
-      messageId = resendData?.id || null;
-    } else {
-      const info = await transporter.sendMail({
-        from: MAIL_FROM,
-        to: recipient,
-        replyTo: MAIL_REPLY_TO || undefined,
-        subject,
-        text,
-        html,
-      });
-      messageId = info?.messageId || null;
-    }
-
-    await ref.set({
-      status: "sent",
-      provider,
-      messageId,
-      sentAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
-
-    return { ok: true, provider, messageId };
-  } catch (err) {
-    console.error("Email send failed:", err);
-    await ref.set({
-      status: "error",
-      error: String(err?.message || "send_failed").slice(0, 500),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
-    return { ok: false, error: "send_failed" };
-  }
-}
-
-function renderFestConfirmationEmail(reg) {
-  const regId = reg?.regId || "—";
-  const fullName = reg?.fullName || "Participant";
-  const college = reg?.college || "—";
-  const subject = `Pharmazephyr 2026 Registration Confirmed • ${regId}`;
-  const text = [
-    `Hi ${fullName},`,
-    "",
-    "Your Pharmazephyr 2026 fest registration is confirmed.",
-    `Reg ID: ${regId}`,
-    `College: ${college}`,
-    "",
-    "Please keep your QR pass and Reg ID ready at entry.",
-    "",
-    "Regards,",
-    "Pharmazephyr 2026 Team",
-  ].join("\n");
-  const html = `
-    <div style="font-family:Inter,Arial,sans-serif;max-width:640px;margin:0 auto;padding:20px;color:#1f1431;">
-      <h2 style="margin:0 0 12px;">Pharmazephyr 2026 Registration Confirmed</h2>
-      <p style="margin:0 0 12px;">Hi ${fullName},</p>
-      <p style="margin:0 0 16px;">Your fest registration is confirmed.</p>
-      <div style="border:1px solid #e4d6ff;border-radius:12px;padding:14px 16px;background:#faf7ff;">
-        <div><strong>Reg ID:</strong> ${regId}</div>
-        <div style="margin-top:6px;"><strong>College:</strong> ${college}</div>
-      </div>
-      <p style="margin:16px 0 0;">Keep your QR pass and Reg ID ready at entry.</p>
-    </div>
-  `;
-  return { subject, text, html };
-}
-
-function renderEventConfirmationEmail({ reg, event }) {
-  const fullName = reg?.fullName || "Participant";
-  const regId = reg?.regId || event?.regId || "—";
-  const eventName = event?.eventName || event?.name || "Event";
-  const category = event?.category || "—";
-  const eventPrice = event?.eventPrice || event?.eventPriceLabel || event?.priceLabel || "—";
-  const subject = `Event Registration Confirmed • ${eventName}`;
-  const text = [
-    `Hi ${fullName},`,
-    "",
-    `Your event registration is confirmed for: ${eventName}`,
-    `Category: ${category}`,
-    `Reg ID: ${regId}`,
-    `Fee: ${eventPrice}`,
-    "",
-    "Regards,",
-    "Pharmazephyr 2026 Team",
-  ].join("\n");
-  const html = `
-    <div style="font-family:Inter,Arial,sans-serif;max-width:640px;margin:0 auto;padding:20px;color:#1f1431;">
-      <h2 style="margin:0 0 12px;">Event Registration Confirmed</h2>
-      <p style="margin:0 0 12px;">Hi ${fullName},</p>
-      <p style="margin:0 0 16px;">Your registration for <strong>${eventName}</strong> is confirmed.</p>
-      <div style="border:1px solid #e4d6ff;border-radius:12px;padding:14px 16px;background:#faf7ff;">
-        <div><strong>Category:</strong> ${category}</div>
-        <div style="margin-top:6px;"><strong>Reg ID:</strong> ${regId}</div>
-        <div style="margin-top:6px;"><strong>Fee:</strong> ${eventPrice}</div>
-      </div>
-    </div>
-  `;
-  return { subject, text, html };
 }
 
 async function markWebhookEventProcessed(eventKey, payload = {}) {
@@ -680,48 +455,6 @@ app.post("/verify", async (req, res) => {
   }
 });
 
-app.post("/registration/send-confirmation", requireUser, requireFirebaseAdmin, async (req, res) => {
-  try {
-    const regId = String(req.body?.regId || "").trim();
-    if (!regId) return res.status(400).json({ error: "regId is required" });
-
-    const regSnap = await adminDb.collection("registrations").doc(regId).get();
-    if (!regSnap.exists) return res.status(404).json({ error: "Registration not found" });
-    const reg = regSnap.data() || {};
-
-    const ownerEmail = normalize(req.userToken.email || "");
-    if (reg.uid && reg.uid !== req.userToken.uid) {
-      return res.status(403).json({ error: "Forbidden" });
-    }
-    if (!reg.uid && normalize(reg.email) !== ownerEmail) {
-      return res.status(403).json({ error: "Forbidden" });
-    }
-
-    const email = normalize(reg.email || ownerEmail);
-    const content = renderFestConfirmationEmail({
-      regId: reg.regId || regId,
-      fullName: reg.fullName || req.userToken.name || "Participant",
-      college: reg.college || "",
-    });
-
-    const emailResult = await sendTransactionalEmail({
-      type: "fest_registration_confirmation",
-      dedupeKey: reg.regId || regId,
-      to: email,
-      ...content,
-      meta: {
-        regId: reg.regId || regId,
-        actorEmail: ownerEmail,
-      },
-    });
-
-    res.json({ ok: true, email: emailResult });
-  } catch (err) {
-    console.error("Fest confirmation email failed:", err);
-    res.status(500).json({ error: "Failed to send confirmation email" });
-  }
-});
-
 app.post("/event/finalize-registration", requireUser, requireFirebaseAdmin, async (req, res) => {
   try {
     const {
@@ -774,23 +507,7 @@ app.post("/event/finalize-registration", requireUser, requireFirebaseAdmin, asyn
       razorpayPaymentId: paymentId || null,
     });
 
-    let emailResult = null;
-    if (result?.emailContext?.reg?.email) {
-      const content = renderEventConfirmationEmail(result.emailContext);
-      emailResult = await sendTransactionalEmail({
-        type: "event_registration_confirmation",
-        dedupeKey: result.docId,
-        to: result.emailContext.reg.email,
-        ...content,
-        meta: {
-          regId: result.emailContext.reg.regId,
-          eventId: result.emailContext.event.eventId,
-          actorEmail: normalize(req.userToken.email || ""),
-        },
-      });
-    }
-
-    res.json({ ok: true, added: !!result?.added, docId: result?.docId, paymentStatus, email: emailResult });
+    res.json({ ok: true, added: !!result?.added, docId: result?.docId, paymentStatus });
   } catch (err) {
     console.error("Event finalize failed:", err);
     res.status(500).json({ error: err?.message || "Event finalization failed" });
